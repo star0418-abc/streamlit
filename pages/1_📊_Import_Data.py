@@ -16,7 +16,16 @@ from logic.importers import (
     load_and_normalize, validate_imported_data, compute_file_hash
 )
 from schemas.canonical import ColumnMapping, get_schema_for_type
-from database.db import create_measurement
+
+# Guard database import - may fail on Cloud if init fails
+try:
+    from database.db import create_measurement
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    create_measurement = None
+    _db_error_msg = str(_db_err)
+
 from utils.i18n import t, init_language, language_selector
 
 # Initialize language

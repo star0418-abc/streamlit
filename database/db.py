@@ -2,30 +2,117 @@
 SQLite database layer with WAL mode for safe concurrent writes.
 
 Uses append-only records with revision tracking for traceability.
+Cloud-aware: Uses /tmp on Streamlit Cloud for writable storage.
 """
 import sqlite3
 import json
 import hashlib
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
-# Database path
-DB_DIR = Path(__file__).parent.parent / "data"
-DB_PATH = DB_DIR / "lab.db"
+# =============================================================================
+# Cloud Environment Detection & Path Configuration
+# =============================================================================
+
+def is_cloud_environment() -> bool:
+    """
+    Detect if running on Streamlit Community Cloud.
+    
+    Cloud indicators:
+    - STREAMLIT_SHARING env var is set
+    - Running from /mount or /app paths (Cloud container paths)
+    - HOME is /home/appuser (Cloud default)
+    """
+    # Check environment variables set by Streamlit Cloud
+    if os.environ.get("STREAMLIT_SHARING"):
+        return True
+    if os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud":
+        return True
+    
+    # Check typical Cloud container paths
+    cwd = os.getcwd()
+    if cwd.startswith("/mount/") or cwd.startswith("/app"):
+        return True
+    
+    # Check home directory (Cloud uses /home/appuser)
+    home = os.environ.get("HOME", "")
+    if home == "/home/appuser":
+        return True
+    
+    return False
+
+
+def get_project_root() -> Path:
+    """Get the project root directory."""
+    return Path(__file__).resolve().parent.parent
+
+
+def get_db_path() -> Path:
+    """
+    Get the database path, using /tmp on Cloud for writable storage.
+    
+    On Cloud: /tmp/lab.db (ephemeral but writable)
+    On Local: {project_root}/data/lab.db
+    """
+    if is_cloud_environment():
+        return Path("/tmp/lab.db")
+    else:
+        return get_project_root() / "data" / "lab.db"
+
+
+def get_db_dir() -> Path:
+    """Get the directory containing the database."""
+    return get_db_path().parent
+
+
+# =============================================================================
+# Lazy Initialization
+# =============================================================================
+
+_initialized = False
+_init_error: Optional[str] = None
+
+
+def _ensure_initialized():
+    """Ensure database is initialized (lazy init on first use)."""
+    global _initialized, _init_error
+    if _initialized:
+        return
+    if _init_error:
+        # Already tried and failed
+        return
+    try:
+        init_database()
+        _initialized = True
+    except Exception as e:
+        _init_error = str(e)
+        # Don't re-raise; let operations handle the error gracefully
 
 
 def ensure_db_dir():
     """Ensure the data directory exists."""
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+    db_dir = get_db_dir()
+    try:
+        db_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        # On Cloud, /tmp should be writable; project dirs may not be
+        pass
 
 
 @contextmanager
 def get_connection():
     """Get a database connection with WAL mode enabled."""
+    _ensure_initialized()
+    
+    if _init_error:
+        raise RuntimeError(f"Database initialization failed: {_init_error}")
+    
     ensure_db_dir()
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    db_path = get_db_path()
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -41,7 +128,12 @@ def get_connection():
 
 def init_database():
     """Initialize the database schema."""
-    with get_connection() as conn:
+    ensure_db_dir()
+    db_path = get_db_path()
+    
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
         conn.executescript("""
             -- Recipes table
             CREATE TABLE IF NOT EXISTS recipes (
@@ -108,6 +200,73 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_measurements_sample ON measurements(sample_id);
             CREATE INDEX IF NOT EXISTS idx_measurements_type ON measurements(measurement_type);
         """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# Diagnostics
+# =============================================================================
+
+def get_diagnostics() -> Dict[str, Any]:
+    """
+    Get environment and database diagnostics for debugging.
+    
+    Returns dict with:
+    - runtime_env: "cloud" or "local"
+    - cwd: current working directory
+    - project_root: detected project root
+    - db_path: database file path
+    - db_exists: whether DB file exists
+    - db_writable: whether DB location is writable
+    - tables: dict of table_name -> row_count (empty if DB not accessible)
+    - init_error: any initialization error message
+    """
+    db_path = get_db_path()
+    project_root = get_project_root()
+    
+    diagnostics = {
+        "runtime_env": "cloud" if is_cloud_environment() else "local",
+        "cwd": os.getcwd(),
+        "project_root": str(project_root),
+        "db_path": str(db_path),
+        "db_exists": db_path.exists(),
+        "db_writable": False,
+        "tables": {},
+        "init_error": _init_error,
+    }
+    
+    # Check if directory is writable
+    db_dir = get_db_dir()
+    try:
+        if db_dir.exists():
+            test_file = db_dir / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+            diagnostics["db_writable"] = True
+    except (PermissionError, OSError):
+        pass
+    
+    # Get table row counts if DB exists
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            cur = conn.cursor()
+            tables = [r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )]
+            for table in tables:
+                try:
+                    count = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    diagnostics["tables"][table] = count
+                except Exception:
+                    diagnostics["tables"][table] = "error"
+            conn.close()
+        except Exception as e:
+            diagnostics["tables"] = {"error": str(e)}
+    
+    return diagnostics
 
 
 def compute_file_hash(file_path: str) -> str:
@@ -365,5 +524,5 @@ def list_measurements(sample_id: Optional[int] = None,
         return [dict(row) for row in rows]
 
 
-# Initialize database on import
-init_database()
+# NOTE: No import-time init_database() call!
+# Database is initialized lazily on first connection via _ensure_initialized()

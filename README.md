@@ -30,6 +30,42 @@ streamlit run app.py
 
 The app will open in your browser at `http://localhost:8501`.
 
+## Cloud Deployment (Streamlit Community Cloud)
+
+The app is designed to run on Streamlit Community Cloud with these considerations:
+
+### Key Cloud Behaviors
+
+| Feature | Local | Cloud |
+|---------|-------|-------|
+| Database path | `data/lab.db` | `/tmp/lab.db` |
+| Data persistence | Permanent | Ephemeral (resets on restart) |
+| File writes | Project folder | `/tmp` only |
+
+### Deploy Steps
+
+1. Push your code to GitHub
+2. Go to [share.streamlit.io](https://share.streamlit.io)
+3. Connect your repo and select `app.py` as entry point
+4. Deploy
+
+### Configuration Requirements
+
+- **Do NOT** add `server.port` or `server.address` to `.streamlit/config.toml`
+- Keep only UI/theme settings in config.toml if needed
+- All dependencies must be in `requirements.txt`
+
+### Troubleshooting Cloud Issues
+
+If you see "Oh no. Error running app." on Cloud:
+
+1. Check the logs in your Streamlit Cloud dashboard
+2. Open the app and expand "🔧 环境检查 / Environment Check" for diagnostics
+3. Common issues:
+   - Missing dependency in `requirements.txt`
+   - Import-time errors in pages (check for missing packages)
+   - Path issues (don't use hardcoded Windows paths like `D:\`)
+
 ## Troubleshooting
 
 ### "No module named 'plotly'"
@@ -153,11 +189,11 @@ d:\cal\
 ├── requirements.txt          # Python dependencies
 ├── pages/                    # Streamlit pages
 ├── logic/                    # Pure computation modules
-├── database/                 # SQLite layer (WAL mode)
+├── database/                 # SQLite layer (WAL mode, Cloud-aware)
 ├── schemas/                  # Canonical DataFrame schemas
 ├── i18n/                     # Translation files (zh-CN.json, en.json)
 ├── utils/                    # Utility modules including i18n.py, deps.py
-└── data/                     # Database + raw files
+└── data/                     # Database + raw files (local only)
 ```
 
 ## Data Schemas
@@ -185,6 +221,7 @@ Every computed result stores:
 - [x] **V0 (MVP)**: Import layer, manual Rb, basic metrics, SQLite saving
 - [x] **i18n**: Chinese/English language support with sidebar toggle
 - [x] **Dependency handling**: Graceful error messages for missing packages
+- [x] **Cloud-ready**: Lazy DB init, /tmp path on Cloud, diagnostics panel
 - [ ] **V1**: Semi-auto Rb, temperature fits, cycle segmentation
 - [ ] **V2**: Analytics dashboards, similar recipe search
 

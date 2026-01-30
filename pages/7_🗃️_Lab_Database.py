@@ -9,12 +9,23 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from database.db import (
-    create_recipe, get_recipe, list_recipes,
-    create_batch, get_batch, list_batches,
-    create_sample, get_sample, list_samples,
-    list_measurements
-)
+# Guard database import - may fail on Cloud if init fails
+try:
+    from database.db import (
+        create_recipe, get_recipe, list_recipes,
+        create_batch, get_batch, list_batches,
+        create_sample, get_sample, list_samples,
+        list_measurements
+    )
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    # Define stubs that return empty data
+    create_recipe = create_batch = create_sample = None
+    get_recipe = get_batch = get_sample = lambda x: None
+    list_recipes = list_batches = list_samples = list_measurements = lambda *a, **kw: []
+    _db_error_msg = str(_db_err)
+
 from utils.i18n import t, init_language, language_selector
 
 # Initialize language
@@ -28,6 +39,17 @@ with st.sidebar:
 
 st.title(t("database.title"))
 st.markdown(t("database.subtitle"))
+
+# Show error if database is not available
+if not DB_AVAILABLE:
+    st.error("❌ 数据库不可用 / Database not available")
+    st.warning(f"详情 / Details: {_db_error_msg}")
+    st.info(
+        "💡 在 Streamlit Cloud 上，数据库使用临时存储。首次访问时会自动初始化。\n\n"
+        "On Streamlit Cloud, the database uses temporary storage and will be initialized on first access."
+    )
+    st.stop()
+
 
 tab1, tab2, tab3, tab4 = st.tabs([
     t("database.tab_recipes"), 

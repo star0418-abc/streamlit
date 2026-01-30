@@ -22,7 +22,17 @@ from logic.eis import (
     find_hf_intercept_direct, prepare_nyquist_data
 )
 from logic.utils import format_sigma
-from database.db import create_measurement, update_measurement_results
+
+# Guard database import - may fail on Cloud if init fails
+try:
+    from database.db import create_measurement, update_measurement_results
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    create_measurement = None
+    update_measurement_results = None
+    _db_error_msg = str(_db_err)
+
 from utils.i18n import t, init_language, language_selector
 
 # Initialize language

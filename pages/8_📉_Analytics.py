@@ -19,7 +19,16 @@ except ImportError:
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from database.db import list_measurements, get_measurement, list_recipes
+# Guard database import - may fail on Cloud if init fails
+try:
+    from database.db import list_measurements, get_measurement, list_recipes
+    DB_AVAILABLE = True
+except Exception as _db_err:
+    DB_AVAILABLE = False
+    list_measurements = list_recipes = lambda *a, **kw: []
+    get_measurement = lambda x: None
+    _db_error_msg = str(_db_err)
+
 from utils.i18n import t, init_language, language_selector
 
 # Initialize language

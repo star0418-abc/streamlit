@@ -82,4 +82,39 @@ with st.expander("🔧 环境检查 / Environment Check"):
         st.code("pip install -r requirements.txt", language="bash")
     else:
         st.success("✅ 所有依赖已安装 / All dependencies installed")
+    
+    # Database diagnostics
+    st.markdown("---")
+    st.markdown("### 数据库状态 / Database Status")
+    
+    try:
+        from database.db import get_diagnostics
+        diag = get_diagnostics()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            env_emoji = "☁️" if diag["runtime_env"] == "cloud" else "💻"
+            st.info(f"{env_emoji} **环境 / Environment**: {diag['runtime_env'].upper()}")
+            st.text(f"工作目录 / CWD: {diag['cwd']}")
+            st.text(f"项目根 / Root: {diag['project_root']}")
+        
+        with col2:
+            db_emoji = "✅" if diag["db_exists"] else "⚠️"
+            write_emoji = "✅" if diag["db_writable"] else "❌"
+            st.info(f"📁 **数据库 / Database**: {diag['db_path']}")
+            st.text(f"文件存在 / Exists: {db_emoji} {diag['db_exists']}")
+            st.text(f"可写入 / Writable: {write_emoji} {diag['db_writable']}")
+        
+        if diag["init_error"]:
+            st.error(f"❌ 初始化错误 / Init Error: {diag['init_error']}")
+        
+        if diag["tables"]:
+            st.markdown("**表格行数 / Table Row Counts:**")
+            table_data = [{"Table": k, "Rows": v} for k, v in diag["tables"].items()]
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+        elif diag["db_exists"]:
+            st.caption("无表格 / No tables found")
+            
+    except Exception as e:
+        st.error(f"❌ 无法获取数据库诊断信息 / Cannot get DB diagnostics: {e}")
 
