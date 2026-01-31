@@ -118,6 +118,9 @@ pip install scipy
 - **Batch & Sample Tracking**: Full traceability from recipe to measurement
 - **Analytics**: Composition vs property trends, similar recipe search
 
+### 更新报告（Changelog）
+- **📋 Update Report**: View version history and recent changes
+
 ## Language / 语言
 
 The app defaults to **Chinese (简体中文)** with an **English** toggle available.
@@ -376,12 +379,46 @@ Every computed result stores:
 - Software version
 - Computed metrics + plot references
 
+## 更新报告 / Changelog
+
+The app includes a changelog page (**📋 更新报告**) showing version history.
+
+### Adding New Entries
+
+Edit `data/changelog_zh.md` and append entries in this format:
+
+```markdown
+## YYYY-MM-DD vX.Y.Z
+
+### 新增功能
+- **功能名称**：功能描述
+
+### 修复
+- 修复内容描述
+
+### 改进
+- 改进内容描述
+```
+
+### Entry Guidelines
+
+- Use Chinese for all content
+- Date format: `YYYY-MM-DD`
+- Version format: `vX.Y.Z` (semantic versioning recommended)
+- Organize changes by category: 新增功能 / 修复 / 改进 / 移除
+
+### Cloud Behavior
+
+On Streamlit Cloud, the changelog file is **read-only** (bundled with the repo).  
+To update the changelog on Cloud, commit changes to `data/changelog_zh.md` and redeploy.
+
 ## Implementation Status
 
 - [x] **V0 (MVP)**: Import layer, manual Rb, basic metrics, SQLite saving
 - [x] **i18n**: Chinese/English language support with sidebar toggle
 - [x] **Dependency handling**: Graceful error messages for missing packages
 - [x] **Cloud-ready**: Lazy DB init, /tmp path on Cloud, diagnostics panel
+- [x] **Changelog**: Version update report page
 - [ ] **V1**: Semi-auto Rb, temperature fits, cycle segmentation
 - [ ] **V2**: Analytics dashboards, similar recipe search
 

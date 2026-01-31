@@ -50,6 +50,8 @@ st.markdown(f"""
 - {t("home.module_c_analytics")}
 - {t("home.module_c_reports")}
 
+### {t("home.module_changelog")}
+
 ---
 *{t("common.version")} {__version__}*
 """)

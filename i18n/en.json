@@ -38,7 +38,8 @@
         "module_c": "Module C: Lab Database",
         "module_c_db": "**🗃️ Lab Database**: Recipes, batches, samples management",
         "module_c_analytics": "**📉 Analytics**: Trends and composition analysis",
-        "module_c_reports": "**📝 Reports**: Export measurement reports"
+        "module_c_reports": "**📝 Reports**: Export measurement reports",
+        "module_changelog": "**📋 Update Report**: View version changelog"
     },
     "import": {
         "page_title": "Import Data - GPE Lab",
@@ -326,5 +327,12 @@
         "tli_gt_one": "tLi⁺ > 1, may not be at steady state or parasitic reactions present",
         "missing_columns": "Missing required columns: {cols}",
         "unit_mismatch": "Unit mismatch: expected {expected}, got {actual}"
+    },
+    "changelog": {
+        "page_title": "Update Report - GPE Lab",
+        "title": "📋 Update Report",
+        "subtitle": "Version changelog (in Chinese)",
+        "no_changelog": "No changelog available. Please contact admin to add data/changelog_zh.md.",
+        "search_placeholder": "Search updates..."
     }
 }
