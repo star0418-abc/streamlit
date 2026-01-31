@@ -207,6 +207,166 @@ All imported data is normalized to canonical internal schemas:
 | CA | t, i, v | s, A, V |
 | Transmittance | t, t_frac | s, [0-1] |
 
+## EIS Analysis Notes
+
+### SciPy Optional
+
+The EIS module (`logic/eis.py`) works without SciPy for basic Rb extraction methods:
+- `find_hf_intercept_direct()` — Direct HF intercept detection
+- `estimate_rb_intercept_linear()` — Linear extrapolation from HF band
+
+Advanced fitting (`fit_simple_rc`) requires SciPy. If missing, it returns `{success: False, error: "SciPy not installed"}`.
+
+### Rb Extraction Assumptions (SS/GPE/SS Cells)
+
+- **HF inductive artifacts** (>100 kHz from lead inductance) are automatically excluded before Rb estimation
+- **Sign convention**: Internal computation uses capacitive-negative Z_im; Nyquist plots display -Z_im (positive upper half)
+- **Frequency-based HF selection**: Uses top 1 decade (freq ≥ fmax/10), not point-count fractions
+
+### RC Fitting Caveats
+
+`fit_simple_rc()` fits ONLY the HF semicircle (Rs + R||C). It is NOT valid for:
+- Full-spectrum Randles+Warburg analysis
+- Diffusion-dominated spectra (blocking electrodes)
+
+For quantitative equivalent circuit analysis, use specialized software (ZView, Relaxis, EC-Lab Z Fit).
+
+## LSV Analysis Notes
+
+### SciPy Optional
+
+LSV smoothing (`logic/lsv.py`) uses Savitzky-Golay filter from SciPy. If SciPy is missing:
+- Smoothing degrades to numpy moving-average (still functional)
+- A warning is included in the result dict
+
+### Onset Detection Methods
+
+| Method | Parameter | Best For |
+|--------|-----------|----------|
+| `threshold` | `onset_method="threshold"` | Clean data with sharp faradaic onset |
+| `tangent` | `onset_method="tangent"` | GPE with baseline drift/current creep |
+
+**Threshold method** (default):
+- Detects when |j| exceeds `threshold_ma_cm2`
+- Requires `min_consecutive=3` points above threshold (avoids single-spike noise)
+- Applies linear interpolation for sub-datapoint precision
+
+**Tangent method** (recommended for GPE):
+- Fits constant/linear baseline from first 10% of sweep (median-based, robust)
+- Identifies rising region via max derivative on smoothed current
+- Fits tangent line around max derivative
+- Onset = intersection of baseline and tangent lines
+
+### CV Auto-Segmentation
+
+If the potential array is non-monotonic (e.g., CV data uploaded instead of LSV):
+- The longest monotonic segment is automatically extracted
+- A warning is included describing what was done
+- The data is NOT sorted (preserves time order for correct onset logic)
+
+### Baseline Correction
+
+The baseline is computed from the **first portion** of the sweep (first 10% or 20 points, whichever larger):
+- Default: constant baseline = median(j) in baseline region
+- Linear baseline used only if R² > 0.7 and doesn't create large negative artifacts
+- This is safer than the old global low-current mask approach for GPE data
+
+### Direction/Sign Sanity
+
+- `direction="oxidation"` expects positive current rise
+- `direction="reduction"` expects negative current drop
+- If the data doesn't match the expected sign, the function warns and returns `onset_v=None` (safe default)
+
+## Transference Number (tLi+) Notes
+
+### Bruce-Vincent Method
+
+The module (`logic/transference.py`) implements the Bruce-Vincent/Evans method:
+
+```
+tLi+ = Iss × (ΔV - I0×R0) / [I0 × (ΔV - Iss×Rss)]
+```
+
+This assumes **small polarization** in the linear regime (typically ΔV ≤ 10-20 mV).
+
+### Strict vs Lenient Mode
+
+| Parameter | `strict=True` (default) | `strict=False` |
+|-----------|------------------------|----------------|
+| Invalid ΔV (≤0) | `success=False` | `success=False` |
+| Large ΔV (>100 mV) | `success=False` | `qc_pass=False` + warning |
+| Effective voltage ≤0 | `success=False` | `qc_pass=False`, `t_li_plus=None` |
+| Invalid R (≤0) | `success=False` | `qc_pass=False`, `t_li_plus=None` |
+
+### Current Sign Convention
+
+Instruments often export negative current by convention. The formula requires magnitudes:
+- `I0_eff = abs(I0)`, `Iss_eff = abs(Iss)`
+- Raw values preserved in output: `I0_raw_A`, `Iss_raw_A`
+- Flag `current_abs_applied=True` indicates sign correction occurred
+
+### Effective Polarization Voltage
+
+The corrected driving voltages are:
+- `dV_eff0 = ΔV - I0×R0` (at t=0)
+- `dV_effss = ΔV - Iss×Rss` (at steady-state)
+
+If either is ≤0, the computation is physically invalid (IR drop exceeds applied voltage).
+
+### I0 Extraction (Capacitive Transient Handling)
+
+The initial current I0 is extracted **after** capacitive settling, not from the first 1% of time blindly:
+
+1. **Transient detection** (`transient_mode="auto"`):
+   - Computes `|dI/dt|` on smoothed current
+   - Finds earliest point where derivative stays small for 5 consecutive readings
+   - Ignores this initial capacitive spike region
+
+2. **I0 window**: First 1% of time after transient, minimum 5 points
+3. **I0 = median(|I|)** in window (robust to outliers)
+
+Metadata returned: `transient_ignored_s`, `i0_n_points`
+
+### Iss Extraction (Steady-State Detection)
+
+Steady-state current Iss is validated, not assumed from "last 10%":
+
+1. **Tail region**: Last 20% of time (configurable)
+2. **Steady detection**: Finds segment where `|dI/dt|` is consistently small (≥10 consecutive points)
+3. If steady found: `ss_detected=True`, `Iss = median` of that segment
+4. If NOT found: `ss_detected=False`, `qc_pass=False`, uses last-window median with warning
+
+### QC Flags
+
+The `qc_flags` list contains structured issue identifiers:
+
+| Flag | Meaning |
+|------|---------|
+| `deltaV_too_large` | ΔV > 100 mV (non-linear regime) |
+| `effective_voltage_nonpositive` | IR drop exceeds ΔV |
+| `iss_ge_i0` | Iss ≥ I0 (unusual, not at steady-state) |
+| `t_negative` | tLi+ < 0 (physics error) |
+| `t_above_unity` | tLi+ > 1 (parasitic reactions or not steady) |
+| `denominator_near_zero` | Numerical instability |
+
+### When `t_li_plus=None`
+
+The function returns `t_li_plus=None` (and `success=False`) when:
+- ΔV ≤ 0
+- R0 or Rss ≤ 0
+- Effective voltage (ΔV - I×R) ≤ 0
+- Denominator near zero
+
+In lenient mode (`strict=False`), large ΔV still attempts computation but sets `qc_pass=False`.
+
+### Recommended Experimental Constraints
+
+For reliable Bruce-Vincent measurements:
+- **Small ΔV**: 10 mV typical, warn above 20 mV, reject above 100 mV
+- **Sufficient polarization time**: Until dI/dt ≈ 0 (check `ss_detected` flag)
+- **Symmetric cells**: Li/GPE/Li or equivalent blocking configuration
+- **Matched EIS**: R0 from EIS before polarization, Rss from EIS after
+
 ## Traceability
 
 Every computed result stores:
