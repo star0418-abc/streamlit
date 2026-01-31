@@ -436,6 +436,113 @@ On Streamlit Cloud without SciPy: Arrhenius fully functional, VFT returns clear 
 | `T0_close_to_Tmin` | Tmin - T₀ < 10 K (unstable VFT) |
 | `vft_overfit_risk` | n ≤ 4 for VFT |
 
+## Smart Window Analysis Notes
+
+### SciPy Optional
+
+The smart window module (`logic/smart_window.py`) works without SciPy:
+- Savitzky-Golay smoothing degrades to numpy moving-average
+- `find_peaks` degrades to simple extrema detection
+- Integration uses `np.trapz` (numpy-only)
+
+Import never fails; missing SciPy only affects smoothing quality.
+
+### Time Alignment (CA + Optical)
+
+Electrochemistry (CA) and optical transmittance data often have **trigger delays** (1–5 s typical) because:
+- Different instruments start at slightly different times
+- Communication/trigger latency between potentiostat and spectrometer
+- Manual start sequences
+
+**Alignment modes** (`lag_mode` parameter):
+
+| Mode | Behavior |
+|------|----------|
+| `"none"` | No lag correction (default, safe for synchronized data) |
+| `"estimate"` | Auto-estimate lag via cross-correlation of |I| vs -dT/dt |
+| `"manual"` | Use user-specified lag value |
+
+The estimation uses:
+1. CA signal: smoothed |I| (current magnitude)
+2. Optical signal: -dT/dt (rate of darkening aligns with charge injection)
+3. Cross-correlation over ±max_lag window
+4. Returns `lag_s`, `lag_correlation`, `lag_confident`
+
+If `lag_confident=False` (correlation < 0.3), the estimate may be unreliable.
+
+### Response Time (Plateau-Based t90)
+
+Previous approach used segment endpoints (`t_start`, `t_end`), which is wrong if:
+- Data collection ends before plateau is reached
+- Noise at endpoints misrepresents actual T values
+
+**New plateau-based definition**:
+
+```
+T0   = median(first 10% of segment)     # Initial plateau
+Tinf = median(last 10% of segment)      # Final plateau
+target = T0 + threshold × (Tinf - T0)
+t90 = time when T(t) first crosses target
+```
+
+**Plateau validation**:
+- `plateau_std_max`: Maximum std for "stable" plateau (default 0.02)
+- `plateau_slope_max`: Maximum |dT/dt| for "settled" plateau (default 0.01/s)
+
+If final plateau quality is poor:
+- `reached_plateau = False`
+- `qc_pass = False`
+- Warning: "Final plateau not reached"
+- `response_time_s` is still returned but flagged as unreliable
+
+### Coloration Efficiency (CE)
+
+CE = ΔOD / |Q| where ΔOD = log₁₀(T_bleached / T_colored).
+
+**Critical**: CE is only meaningful for **coloring segments** (OD increases, T decreases).
+
+| Segment Type | CE Behavior |
+|--------------|-------------|
+| Coloring (ΔOD > 0) | Computed normally |
+| Bleaching (ΔOD < 0) | `ce_cm2_c = None`, `ce_skipped_reason = "bleaching_segment"` |
+| Unknown (\|ΔOD\| < 0.01) | `ce_cm2_c = None`, `ce_skipped_reason = "unknown_segment"` |
+
+**Full cycle handling**:
+If a segment spans both coloring→bleaching, net Q approaches zero, causing CE to blow up.
+- `auto_split_full_cycles=True` (default) detects this and splits at T extremum
+- Flag `segment_was_split_for_ce=True` indicates auto-splitting occurred
+
+### Baseline Correction (Default OFF)
+
+The old approach fitted a line to the **initial portion** of current and subtracted it—this is **physically wrong** because:
+- Initial current spike is the main faradaic signal (coloring/bleaching)
+- Fitting to it removes the signal you want to integrate
+
+**New modes** (`baseline_mode`):
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `"none"` | No correction (default) | Most cases; safest |
+| `"offset_tail"` | Subtract median of last 10% | Remove DC offset only |
+| `"offset_head"` | Subtract median of first portion | If pre-step baseline exists |
+| `"linear_tail"` | Fit linear to tail; reject if R² < 0.8 | Only for clear drift |
+
+### QC Flags
+
+All functions return structured QC metadata:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `qc_pass` | bool | Overall quality check passed |
+| `warnings` | list[str] | Human-readable issues |
+| `reached_plateau` | bool | Final plateau reached (response time) |
+| `plateau_quality` | dict | `{t0_std, tinf_std, tinf_slope}` |
+| `segment_type` | str | `"coloring"`, `"bleaching"`, `"unknown"` |
+| `lag_confident` | bool | Lag estimate is reliable (alignment) |
+| `ce_skipped_reason` | str | Why CE was not computed |
+
+`compute_cycling_metrics()` aggregates: `n_valid`, `n_coloring`, `n_bleaching`, `pct_valid`.
+
 ## Traceability
 
 Every computed result stores:
