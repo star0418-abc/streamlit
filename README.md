@@ -370,6 +370,72 @@ For reliable Bruce-Vincent measurements:
 - **Symmetric cells**: Li/GPE/Li or equivalent blocking configuration
 - **Matched EIS**: R0 from EIS before polarization, Rss from EIS after
 
+## Temperature Fits Notes
+
+### Why Log-Space Fitting (VFT)
+
+The VFT equation is fitted in log-space: `ln(σ) = ln(A) - B/(T - T₀)`.
+
+**Problem with linear-scale fitting**: When fitting `σ = A × exp(-B/(T-T₀))` directly, high-temperature data points with large σ values dominate the residuals, biasing T₀ and B. Low-temperature points (critical for T₀ determination) are effectively ignored.
+
+**Solution**: Log-space fitting gives equal **relative** weight to all data points, which is appropriate for conductivity spanning orders of magnitude.
+
+### Why AICc/BIC Instead of R²
+
+The previous approach comparing `vft_r2 - arr_r2 > 0.02` is biased:
+
+| Metric | Arrhenius (k=2) | VFT (k=3) | Issue |
+|--------|-----------------|-----------|-------|
+| R² | Lower | Higher | VFT always wins with more params |
+| AICc | Fair | Fair | Penalizes extra parameter |
+| BIC | Fair | Fair | Stronger penalty for complexity |
+
+**Recommendation rules (ΔAICc = VFT - Arrhenius)**:
+- |Δ| ≤ 2: Inconclusive (use simpler Arrhenius)
+- 2-4: Weak evidence
+- 4-7: Moderate evidence
+- >10: Strong evidence
+
+### Temperature Unit Handling
+
+| Input Detected | Action |
+|----------------|--------|
+| median(T) < 150 AND max(T) < 250 | Auto-convert °C → K with warning |
+| Any T < 0 | Auto-convert °C → K with warning |
+| Otherwise | Assume Kelvin |
+
+Override with `temp_unit="K"` or `temp_unit="C"` to skip auto-detection.
+
+### VFT Prefactor Options
+
+| Option | Equation | Use Case |
+|--------|----------|----------|
+| `standard` | ln(σ) = ln(A) - B/(T-T₀) | Default, most common |
+| `T^-1` | ln(σ) = ln(A) - ln(T) - B/(T-T₀) | Theoretical models |
+| `T^-0.5` | ln(σ) = ln(A) - 0.5·ln(T) - B/(T-T₀) | Some polymer systems |
+
+All three have the same number of fitted parameters (k=3).
+
+### SciPy Dependency
+
+| Function | SciPy Required | Notes |
+|----------|----------------|-------|
+| `arrhenius_fit()` | No | Pure numpy linear fit |
+| `vft_fit()` | Yes | Nonlinear curve_fit |
+| `compare_fits()` | Partial | Arrhenius works; VFT returns `success=False` |
+
+On Streamlit Cloud without SciPy: Arrhenius fully functional, VFT returns clear error message.
+
+### QC Flags
+
+| Flag | Meaning |
+|------|---------|
+| `too_few_points_for_model` | n ≤ k+1 (AICc invalid) |
+| `narrow_temperature_span` | ΔT < 30 K (inconclusive fits) |
+| `temp_unit_auto_converted` | Celsius was auto-detected |
+| `T0_close_to_Tmin` | Tmin - T₀ < 10 K (unstable VFT) |
+| `vft_overfit_risk` | n ≤ 4 for VFT |
+
 ## Traceability
 
 Every computed result stores:
