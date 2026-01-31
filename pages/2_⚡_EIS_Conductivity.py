@@ -38,11 +38,15 @@ except Exception as _db_err:
 
 from utils.i18n import t, init_language, language_selector
 from utils.version import get_app_version
+from utils.ui_header import render_top_banner
 
 # Initialize language
 init_language()
 
 st.set_page_config(page_title=t("eis.page_title"), page_icon="⚡", layout="wide")
+
+# Render top banner
+render_top_banner()
 
 # Sidebar language selector
 with st.sidebar:

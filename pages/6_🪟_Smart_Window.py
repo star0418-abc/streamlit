@@ -29,11 +29,15 @@ from logic.smart_window import (
     compute_cycling_metrics, classify_step
 )
 from utils.i18n import t, init_language, language_selector
+from utils.ui_header import render_top_banner
 
 # Initialize language
 init_language()
 
 st.set_page_config(page_title=t("smart_window.page_title"), page_icon="🪟", layout="wide")
+
+# Render top banner
+render_top_banner()
 
 # Sidebar language selector
 with st.sidebar:

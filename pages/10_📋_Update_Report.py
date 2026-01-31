@@ -13,6 +13,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 from utils.i18n import t, init_language, language_selector
 from utils.changelog import read_changelog_markdown, filter_changelog_content
+from utils.ui_header import render_top_banner
 
 # Page configuration
 st.set_page_config(
@@ -23,6 +24,9 @@ st.set_page_config(
 
 # Initialize language
 init_language()
+
+# Render top banner
+render_top_banner()
 
 # Sidebar
 with st.sidebar:

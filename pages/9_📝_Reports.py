@@ -16,11 +16,15 @@ if _PROJECT_ROOT not in sys.path:
 from database.db import list_measurements, get_measurement
 from utils.i18n import t, init_language, language_selector, get_current_language
 from utils.version import get_app_version
+from utils.ui_header import render_top_banner
 
 # Initialize language
 init_language()
 
 st.set_page_config(page_title=t("reports.page_title"), page_icon="📝", layout="wide")
+
+# Render top banner
+render_top_banner()
 
 # Sidebar language selector
 with st.sidebar:

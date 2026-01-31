@@ -30,11 +30,15 @@ except Exception as _db_err:
     _db_error_msg = str(_db_err)
 
 from utils.i18n import t, init_language, language_selector
+from utils.ui_header import render_top_banner
 
 # Initialize language
 init_language()
 
 st.set_page_config(page_title=t("database.page_title"), page_icon="🗃️", layout="wide")
+
+# Render top banner
+render_top_banner()
 
 # Sidebar language selector
 with st.sidebar:

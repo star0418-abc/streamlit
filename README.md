@@ -223,6 +223,28 @@ The home page displays a navigation dashboard with clickable cards linking to ea
 - Graceful fallback for older Streamlit versions
 - Environment diagnostics run only on button click (not on every rerun)
 
+## Top Banner
+
+A small header banner displays founder and maintainer information at the top of every page:
+
+- **Founder**: USTC-National Synchrotron Radiation Laboratory
+- **Maintainer**: HENU
+
+### Editing the Banner Text
+
+To modify the displayed text, edit the i18n keys in both language files:
+
+| Key | File | Purpose |
+|-----|------|---------|
+| `common.founder_label` | `i18n/zh-CN.json`, `i18n/en.json` | Label (e.g., "Founder" / "创办") |
+| `common.maintainer_label` | same | Label (e.g., "Maintainer" / "维护") |
+| `common.founder_value` | same | Institution name |
+| `common.maintainer_value` | same | Maintainer name |
+
+### Editing the Banner Styling
+
+To change the banner appearance (font size, color, layout), edit `utils/ui_header.py`.
+
 ## Data Schemas
 
 All imported data is normalized to canonical internal schemas:

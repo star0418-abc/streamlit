@@ -17,6 +17,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 # Now import local modules
 from utils.i18n import t, init_language, language_selector
 from utils.version import get_app_version
+from utils.ui_header import render_top_banner
 
 __version__ = get_app_version()
 
@@ -29,6 +30,9 @@ st.set_page_config(
 
 # Initialize language and add selector to sidebar
 init_language()
+
+# Render top banner (founder/maintainer info)
+render_top_banner()
 
 # Sidebar with language selector at top
 with st.sidebar:

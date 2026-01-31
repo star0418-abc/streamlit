@@ -16,7 +16,11 @@
         "delete": "删除",
         "cancel": "取消",
         "confirm": "确认",
-        "version": "版本"
+        "version": "版本",
+        "founder_label": "创办",
+        "maintainer_label": "维护",
+        "founder_value": "USTC-National Synchrotron Radiation Laboratory",
+        "maintainer_value": "HENU"
     },
     "sidebar": {
         "language_label": "语言 / Language",

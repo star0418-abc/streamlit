@@ -13,11 +13,15 @@ if _PROJECT_ROOT not in sys.path:
 
 from logic.transference import compute_transference
 from utils.i18n import t, init_language, language_selector
+from utils.ui_header import render_top_banner
 
 # Initialize language
 init_language()
 
 st.set_page_config(page_title=t("transference.page_title"), page_icon="🔋", layout="wide")
+
+# Render top banner
+render_top_banner()
 
 # Sidebar language selector
 with st.sidebar:
