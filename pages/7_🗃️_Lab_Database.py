@@ -6,8 +6,11 @@ import pandas as pd
 from datetime import date
 from pathlib import Path
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 # Guard database import - may fail on Cloud if init fails
 try:

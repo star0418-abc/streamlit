@@ -7,11 +7,15 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from database.db import list_measurements, get_measurement
 from utils.i18n import t, init_language, language_selector, get_current_language
+from utils.version import get_app_version
 
 # Initialize language
 init_language()
@@ -89,7 +93,7 @@ if measurements:
                     report = {
                         "report_generated": datetime.now().isoformat(),
                         "measurement": meas,
-                        "software_version": "0.1.0"
+                        "software_version": get_app_version()
                     }
                     
                     json_str = json.dumps(report, indent=2, default=str)

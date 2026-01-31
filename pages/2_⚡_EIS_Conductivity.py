@@ -14,8 +14,11 @@ except ImportError:
     PLOTLY_AVAILABLE = False
     go = None
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from logic.eis import (
     compute_conductivity, estimate_rb_intercept_linear,
@@ -34,6 +37,7 @@ except Exception as _db_err:
     _db_error_msg = str(_db_err)
 
 from utils.i18n import t, init_language, language_selector
+from utils.version import get_app_version
 
 # Initialize language
 init_language()
@@ -210,7 +214,7 @@ if imported and imported.get("type") == "EIS":
                         import_mapping=imported["mapping"],
                         params=result["params"],
                         results={"sigma_s_cm": sigma, "qc_checks": qc_checks},
-                        software_version="0.1.0"
+                        software_version=get_app_version()
                     )
                     st.success(t("import.saved_id", id=measurement_id))
         else:

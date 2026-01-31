@@ -187,7 +187,8 @@ t("import.import_success", count=100)  # → "✅ Successfully imported 100 rows
 
 ```
 d:\cal\
-├── app.py                    # Entry point
+├── app.py                    # Entry point (navigation dashboard)
+├── VERSION                   # Single source of truth for app version
 ├── run_streamlit.bat         # Windows launcher
 ├── requirements.txt          # Python dependencies
 ├── pages/                    # Streamlit pages
@@ -195,9 +196,32 @@ d:\cal\
 ├── database/                 # SQLite layer (WAL mode, Cloud-aware)
 ├── schemas/                  # Canonical DataFrame schemas
 ├── i18n/                     # Translation files (zh-CN.json, en.json)
-├── utils/                    # Utility modules including i18n.py, deps.py
+├── utils/                    # Utility modules
+│   ├── i18n.py               # Internationalization utilities
+│   ├── deps.py               # Dependency checking
+│   ├── pathing.py            # Project root detection (idempotent)
+│   └── version.py            # Version resolver (env → file → fallback)
 └── data/                     # Database + raw files (local only)
 ```
+
+## Version Management
+
+The app version is managed via a single source of truth:
+
+| Priority | Source | Usage |
+|----------|--------|-------|
+| 1 | Environment variable `GPE_LAB_VERSION` | CI/CD overrides |
+| 2 | `VERSION` file at project root | Normal usage |
+| 3 | Fallback constant `0.0.0` | Safety net |
+
+All modules use `get_app_version()` from `utils/version.py` to ensure consistency.
+
+## Home Page Navigation
+
+The home page displays a navigation dashboard with clickable cards linking to each page.
+- Uses `st.page_link` (Streamlit ≥1.31) for direct navigation
+- Graceful fallback for older Streamlit versions
+- Environment diagnostics run only on button click (not on every rerun)
 
 ## Data Schemas
 

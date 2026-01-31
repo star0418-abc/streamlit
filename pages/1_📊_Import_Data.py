@@ -7,9 +7,11 @@ import tempfile
 import os
 from pathlib import Path
 
-# Add parent directory to path for imports
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from logic.importers import (
     detect_file_format, preview_file, suggest_column_mapping,
@@ -27,6 +29,7 @@ except Exception as _db_err:
     _db_error_msg = str(_db_err)
 
 from utils.i18n import t, init_language, language_selector
+from utils.version import get_app_version
 
 # Initialize language
 init_language()
@@ -234,7 +237,7 @@ if uploaded_file is not None:
                                 raw_file_path=uploaded_file.name,
                                 raw_file_hash=file_hash,
                                 import_mapping=mapping.to_dict(),
-                                software_version="0.1.0"
+                                software_version=get_app_version()
                             )
                             st.success(t("import.saved_id", id=measurement_id))
                 

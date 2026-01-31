@@ -5,8 +5,11 @@ import streamlit as st
 import numpy as np
 from pathlib import Path
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from logic.transference import compute_transference
 from utils.i18n import t, init_language, language_selector

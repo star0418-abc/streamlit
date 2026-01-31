@@ -16,8 +16,11 @@ except ImportError:
     go = None
     make_subplots = None
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from logic.smart_window import (
     align_ca_transmittance, compute_delta_t, compute_response_time,

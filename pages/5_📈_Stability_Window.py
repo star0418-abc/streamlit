@@ -13,8 +13,11 @@ except ImportError:
     PLOTLY_AVAILABLE = False
     go = None
 
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from logic.lsv import find_onset_potential, find_stability_window
 from utils.i18n import t, init_language, language_selector

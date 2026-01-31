@@ -5,10 +5,12 @@ Displays the version changelog for the application.
 """
 import streamlit as st
 
-# Import i18n utilities
+# Idempotent path setup (avoids duplicate insertions on reruns)
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 from utils.i18n import t, init_language, language_selector
 from utils.changelog import read_changelog_markdown, filter_changelog_content
 
