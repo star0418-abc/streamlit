@@ -144,13 +144,15 @@ if ca_data is not None and tt_data is not None:
         
         manual_lag_s = 0.0
         max_lag_s = 10.0
+        lag_signal_mode = "coloring_only"  # default
+        
         if lag_mode == "manual":
             manual_lag_s = st.number_input(
                 "手动延迟 / Manual Lag (s)", 
                 value=0.0, 
                 min_value=-20.0, 
                 max_value=20.0,
-                help="正值表示光学数据滞后于CA数据"
+                help="正值表示光学数据滞后于CA数据 / Positive = optical lags CA"
             )
         elif lag_mode == "estimate":
             max_lag_s = st.number_input(
@@ -159,6 +161,57 @@ if ca_data is not None and tt_data is not None:
                 min_value=1.0, 
                 max_value=30.0
             )
+            lag_signal_mode = st.selectbox(
+                "相关信号模式 / Correlation Signal Mode",
+                ["coloring_only", "bleaching_only", "max_abs_corr", "full_cycle"],
+                index=0,
+                help="coloring_only (推荐): 仅使用着色段估计延迟，避免符号抵消\n"
+                     "bleaching_only: 仅使用褪色段\n"
+                     "max_abs_corr: 两段都尝试，选相关性最高的\n"
+                     "full_cycle: 旧方法，可能导致相关性抵消"
+            )
+        
+        st.caption(
+            "💡 **延迟约定**: 正延迟 = 光学信号滞后于电化学信号，"
+            "校正时将从光学时间中减去此值。"
+        )
+    
+    # Baseline correction for leakage current (GPE)
+    with st.expander("⚡ 漏电流校正 / Leakage Current Correction (GPE)"):
+        st.markdown(
+            "**问题**: GPE系统存在漏电流，导致Q随测试时间增长，"
+            "CE在不同测试时长间不可比。\n\n"
+            "**Problem**: In GPE systems, leakage current causes Q to grow with time "
+            "even after optical plateau, making CE non-comparable across test durations."
+        )
+        
+        baseline_mode = st.selectbox(
+            "基线校正模式 / Baseline Correction Mode",
+            ["none", "offset_tail", "offset_head", "offset_both"],
+            index=0,
+            help="none: 不校正 (液态电解质)\n"
+                 "offset_tail (推荐GPE): 用尾部中值作为漏电流基线\n"
+                 "offset_head: 用头部中值\n"
+                 "offset_both: 头尾平均"
+        )
+        
+        tail_fraction = 0.2
+        if baseline_mode != "none":
+            tail_fraction = st.slider(
+                "尾部比例 / Tail Fraction", 
+                min_value=0.1, 
+                max_value=0.4, 
+                value=0.2,
+                step=0.05,
+                help="用于估计漏电流的数据尾部比例"
+            )
+            st.info(
+                "✅ 启用漏电流校正后，将同时输出原始和校正后的Q/CE值。"
+            )
+        else:
+            st.warning(
+                "⚠️ **GPE用户注意**: 如果数据包含显著漏电流，建议选择 `offset_tail` 模式。"
+            )
     
     # Align data with new parameters
     merged_df, align_meta = align_ca_transmittance(
@@ -166,7 +219,8 @@ if ca_data is not None and tt_data is not None:
         tolerance_s=time_tolerance,
         lag_mode=lag_mode,
         max_lag_s=max_lag_s,
-        manual_lag_s=manual_lag_s
+        manual_lag_s=manual_lag_s,
+        lag_signal_mode=lag_signal_mode
     )
     
     st.caption(t("smart_window.aligned_points", 
@@ -182,6 +236,17 @@ if ca_data is not None and tt_data is not None:
             lag_corr = align_meta.get('lag_correlation', 0)
             conf_icon = "✅" if lag_conf else "⚠️"
             st.caption(f"估计延迟 / Estimated lag: {lag_s:.2f} s (r={lag_corr:.3f}) {conf_icon}")
+            
+            # Show which segment was used
+            est_meta = align_meta.get("align_meta", {}).get("lag_estimation", {})
+            if est_meta:
+                seg_used = est_meta.get("segment_used", "unknown")
+                col_frac = est_meta.get("coloring_fraction", 0)
+                bl_frac = est_meta.get("bleaching_fraction", 0)
+                st.caption(
+                    f"使用段 / Segment used: {seg_used} "
+                    f"(着色:{col_frac:.0%}, 褪色:{bl_frac:.0%})"
+                )
         else:
             st.caption(f"手动延迟 / Manual lag: {lag_s:.2f} s")
         
@@ -215,14 +280,20 @@ if ca_data is not None and tt_data is not None:
             t_min = float(np.nanmin(t_frac))
             delta_t = compute_delta_t(t_max, t_min)
             
-            # Charge
-            q_result = compute_charge_density(t_s, i_a, area)
+            # Charge with optional baseline correction
+            q_result = compute_charge_density(
+                t_s, i_a, area,
+                baseline_mode=baseline_mode,
+                tail_fraction=tail_fraction
+            )
             
-            # CE (with step type)
+            # CE (with step type and raw Q for comparison)
             ce_result = compute_coloration_efficiency(
                 t_max, t_min, 
                 q_result["q_abs_c_cm2"],
-                step_type=segment_type
+                q_c_cm2_raw=q_result.get("q_abs_c_cm2_raw") if baseline_mode != "none" else None,
+                step_type=segment_type,
+                baseline_mode_used=baseline_mode
             )
             
             # Response time (plateau-based)
@@ -247,8 +318,12 @@ if ca_data is not None and tt_data is not None:
             
             with col4:
                 ce = ce_result.get("ce_cm2_c")
+                ce_raw = ce_result.get("ce_cm2_c_raw")
                 if ce is not None:
-                    st.metric("CE", f"{ce:.1f} cm²/C")
+                    label = "CE" if baseline_mode == "none" else "CE (校正)"
+                    st.metric(label, f"{ce:.1f} cm²/C")
+                    if ce_raw is not None and baseline_mode != "none":
+                        st.caption(f"原始: {ce_raw:.1f}")
                 else:
                     reason = ce_result.get("ce_skipped_reason", "N/A")
                     st.metric("CE", "—")
@@ -269,6 +344,7 @@ if ca_data is not None and tt_data is not None:
             
             # QC Warnings
             all_warnings = (
+                q_result.get("warnings", []) +
                 ce_result.get("warnings", []) + 
                 ce_result.get("errors", []) +
                 rt_result.get("warnings", []) +
@@ -278,7 +354,16 @@ if ca_data is not None and tt_data is not None:
                 st.warning(w)
             
             st.caption(f"ΔOD = {ce_result.get('delta_od', 0):.4f} (log₁₀ base)")
-            st.caption(f"Q = {q_result['q_abs_c_cm2']:.4f} C/cm² (signed: {q_result.get('q_signed', 0):.4f})")
+            
+            # Show Q with baseline info
+            q_text = f"Q = {q_result['q_abs_c_cm2']:.4f} C/cm²"
+            if baseline_mode != "none":
+                q_raw = q_result.get('q_abs_c_cm2_raw', 0)
+                i_baseline = q_result.get('i_baseline_A', 0)
+                q_text += f" (原始: {q_raw:.4f}, 漏电流: {i_baseline:.2e} A)"
+            else:
+                q_text += f" (signed: {q_result.get('q_signed', 0):.4f})"
+            st.caption(q_text)
             
             # Plateau quality info
             pq = rt_result.get("plateau_quality", {})
@@ -351,12 +436,14 @@ if ca_data is not None and tt_data is not None:
         if cycles:
             st.success(t("smart_window.found_segments", count=len(cycles)))
             
-            # Compute per-cycle metrics with QC
+            # Compute per-cycle metrics with QC and baseline correction
             cycle_df = compute_cycling_metrics(
                 cycles, t_frac_valid, i_a_valid, t_s_valid, area,
                 response_threshold=response_threshold,
                 validate_plateau=True,
-                auto_split_full_cycles=True
+                auto_split_full_cycles=True,
+                baseline_mode=baseline_mode,
+                tail_fraction=tail_fraction
             )
             
             if len(cycle_df) > 0:
@@ -367,6 +454,10 @@ if ca_data is not None and tt_data is not None:
                 
                 st.caption(f"有效周期 / Valid cycles: {n_valid}/{n_total} ({pct_valid:.0f}%)")
                 
+                # Show baseline mode if applied
+                if baseline_mode != "none":
+                    st.caption(f"📊 基线校正模式 / Baseline mode: {baseline_mode}")
+                
                 # Color code by segment type
                 def highlight_type(row):
                     if row.get("segment_type") == "coloring":
@@ -375,11 +466,14 @@ if ca_data is not None and tt_data is not None:
                         return ["background-color: #fff3e0"] * len(row)
                     return [""] * len(row)
                 
-                # Select columns to display
+                # Select columns to display (add raw columns if baseline correction applied)
                 display_cols = [
                     "cycle_label", "segment_type", "delta_t", "ce_cm2_c", 
                     "q_c_cm2", "response_time_s", "reached_plateau", "qc_pass"
                 ]
+                if baseline_mode != "none":
+                    display_cols.insert(4, "ce_cm2_c_raw")
+                    display_cols.insert(6, "q_c_cm2_raw")
                 display_cols = [c for c in display_cols if c in cycle_df.columns]
                 
                 st.dataframe(

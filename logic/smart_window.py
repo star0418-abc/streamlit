@@ -6,11 +6,13 @@ and cycle segmentation.
 
 SCIPY OPTIONAL:
 - Savitzky-Golay smoothing and peak detection require SciPy; degrade to numpy if missing.
-- Integration uses np.trapz (numpy-only).
+- Integration uses trapezoidal rule (numpy-only).
 
 TIME ALIGNMENT:
 - CA (electrochemistry) and optical transmittance may have trigger delays (1-5 s typical).
 - align_ca_transmittance() can estimate and correct this lag via cross-correlation.
+- NEW v2.0: Segment-aware lag estimation (lag_signal_mode parameter) fixes sign cancellation
+  that occurred when coloring and bleaching have opposite dT/dt signs.
 
 RESPONSE TIME:
 - Uses plateau-based definition: T0/Tinf from segment endpoints, not raw endpoints.
@@ -19,9 +21,13 @@ RESPONSE TIME:
 CE COMPUTATION:
 - Computed ONLY for coloring segments (ΔOD > 0).
 - Full color+bleach cycles are auto-split to avoid Q_net ~ 0 blowup.
+- NEW v2.0: baseline_mode parameter in compute_charge_density and compute_cycling_metrics
+  allows correction for leakage current in GPE systems (offset_tail mode recommended).
 
-BASELINE CORRECTION:
-- Default is OFF. Never fit baseline to initial transient.
+BASELINE/LEAKAGE CORRECTION (NEW v2.0):
+- Default is OFF (baseline_mode="none").
+- For GPE systems: use baseline_mode="offset_tail" to remove leakage current before Q integration.
+- Returns both raw and corrected Q/CE values for comparison.
 """
 import numpy as np
 import pandas as pd
@@ -41,6 +47,19 @@ try:
     SCIPY_AVAILABLE = True
 except ImportError:
     pass
+
+
+# =============================================================================
+# Numpy version compatibility (trapz renamed to trapezoid in numpy 2.0)
+# =============================================================================
+def _trapz(y: np.ndarray, x: np.ndarray) -> float:
+    """Trapezoidal integration, compatible with numpy 1.x and 2.x."""
+    try:
+        # numpy >= 2.0
+        return float(np.trapezoid(y, x))  # type: ignore
+    except AttributeError:
+        # numpy < 2.0
+        return float(np.trapz(y, x))
 
 
 # =============================================================================
@@ -117,7 +136,7 @@ def _simple_find_extrema(arr: np.ndarray, prominence: float = 0.05) -> Tuple[np.
 
 
 # =============================================================================
-# Time Alignment with Lag Estimation
+# Time Alignment with Lag Estimation (Segment-Aware)
 # =============================================================================
 
 def _estimate_time_lag(
@@ -125,10 +144,16 @@ def _estimate_time_lag(
     t_opt: np.ndarray, t_frac: np.ndarray,
     max_lag_s: float = 10.0,
     dt: float = 0.2,
-    smooth_window: int = 11
-) -> Tuple[float, float, bool, List[str]]:
+    smooth_window: int = 11,
+    lag_signal_mode: Literal["coloring_only", "bleaching_only", "max_abs_corr", "full_cycle"] = "coloring_only",
+    min_segment_fraction: float = 0.15
+) -> Tuple[float, float, bool, Dict[str, Any]]:
     """
     Estimate time lag between CA and optical data using cross-correlation.
+    
+    FIXED: Uses segment-aware correlation to avoid sign-cancellation.
+    - Full bidirectional cycles cause correlation cancellation if mixed.
+    - Solution: correlate within coloring or bleaching segment only.
     
     Args:
         t_ca: CA time array (s)
@@ -138,81 +163,214 @@ def _estimate_time_lag(
         max_lag_s: Maximum lag to search
         dt: Resampling interval
         smooth_window: Smoothing window for derivative
+        lag_signal_mode: Which segment(s) to use for correlation:
+            - "coloring_only": Use segment where T decreases (dT/dt < 0)
+            - "bleaching_only": Use segment where T increases (dT/dt > 0)
+            - "max_abs_corr": Try both and pick lag with best |correlation|
+            - "full_cycle": Legacy behavior (may cancel, not recommended)
+        min_segment_fraction: Minimum fraction of points in segment
     
     Returns:
-        (lag_s, correlation, confident, warnings)
+        (lag_s, correlation, confident, metadata)
         - lag_s: Estimated lag (positive = optical lags current)
-        - correlation: Max correlation coefficient
-        - confident: Whether correlation is above threshold
-        - warnings: List of warnings
+        - correlation: Best correlation coefficient achieved
+        - confident: Whether estimate is reliable
+        - metadata: Dict with detailed diagnostics
     """
-    warnings = []
+    meta: Dict[str, Any] = {
+        "warnings": [],
+        "lag_signal_mode_requested": lag_signal_mode,
+        "lag_signal_mode_used": lag_signal_mode,
+        "segment_used": None,
+        "i_signal": "abs",
+        "optical_signal": "abs_dTdt",
+        "best_corr": 0.0,
+        "second_best_corr": None,
+        "corr_margin": None,
+        "n_points_used": 0,
+        "coloring_fraction": 0.0,
+        "bleaching_fraction": 0.0,
+    }
     
     # Build common time grid
     t_min = max(t_ca.min(), t_opt.min())
     t_max = min(t_ca.max(), t_opt.max())
     
     if t_max - t_min < max_lag_s * 2:
-        warnings.append(f"Overlap too short for lag estimation ({t_max - t_min:.1f} s)")
-        return 0.0, 0.0, False, warnings
+        meta["warnings"].append(f"Overlap too short for lag estimation ({t_max - t_min:.1f} s)")
+        return 0.0, 0.0, False, meta
     
     t_common = np.arange(t_min, t_max, dt)
     if len(t_common) < 20:
-        warnings.append("Insufficient points for lag estimation")
-        return 0.0, 0.0, False, warnings
+        meta["warnings"].append("Insufficient points for lag estimation")
+        return 0.0, 0.0, False, meta
     
-    # Interpolate CA: use |I| as signal
-    i_interp = np.interp(t_common, t_ca, np.abs(i_ca))
-    i_smooth, _ = _optional_smooth(i_interp, smooth_window)
-    
-    # Interpolate optical: use -dT/dt (rate of darkening aligns with current)
+    # Interpolate signals
+    i_interp = np.interp(t_common, t_ca, i_ca)
     t_frac_interp = np.interp(t_common, t_opt, t_frac)
+    
+    # Smooth optical for derivative
     t_frac_smooth, _ = _optional_smooth(t_frac_interp, smooth_window)
     
-    # Compute derivative: -dT/dt
-    dt_optical = -np.gradient(t_frac_smooth, dt)
-    dt_optical_smooth, _ = _optional_smooth(dt_optical, smooth_window // 2 + 1)
+    # Compute dT/dt
+    dTdt = np.gradient(t_frac_smooth, dt)
+    dTdt_smooth, _ = _optional_smooth(dTdt, smooth_window // 2 + 1)
     
-    # Normalize signals
-    if np.std(i_smooth) < 1e-12 or np.std(dt_optical_smooth) < 1e-12:
-        warnings.append("Signal variance too low for correlation")
-        return 0.0, 0.0, False, warnings
+    # Detect coloring vs bleaching segments
+    eps = 0.001 * np.std(dTdt_smooth) if np.std(dTdt_smooth) > 1e-12 else 1e-6
+    coloring_mask = dTdt_smooth < -eps   # T decreasing = coloring
+    bleaching_mask = dTdt_smooth > eps   # T increasing = bleaching
     
-    i_norm = (i_smooth - np.mean(i_smooth)) / np.std(i_smooth)
-    opt_norm = (dt_optical_smooth - np.mean(dt_optical_smooth)) / np.std(dt_optical_smooth)
+    coloring_frac = coloring_mask.sum() / len(t_common)
+    bleaching_frac = bleaching_mask.sum() / len(t_common)
+    meta["coloring_fraction"] = float(coloring_frac)
+    meta["bleaching_fraction"] = float(bleaching_frac)
     
-    # Cross-correlation over lag range
-    n_lags = int(max_lag_s / dt)
-    lags = np.arange(-n_lags, n_lags + 1) * dt
-    correlations = []
+    def _correlate_segment(mask: np.ndarray, segment_name: str) -> Tuple[float, float, int, List[str]]:
+        """Run cross-correlation on a masked segment using abs(i) vs abs(dT/dt)."""
+        seg_warnings = []
+        
+        if mask.sum() < max(10, min_segment_fraction * len(t_common)):
+            seg_warnings.append(f"{segment_name} segment too small ({mask.sum()} points)")
+            return 0.0, 0.0, 0, seg_warnings
+        
+        # Use abs(i) and abs(dT/dt) for robust polarity-independent correlation
+        i_seg_full = np.abs(i_interp)
+        opt_seg_full = np.abs(dTdt_smooth)
+        
+        # Smooth current
+        i_seg_smooth, _ = _optional_smooth(i_seg_full, smooth_window)
+        
+        # Normalize
+        if np.std(i_seg_smooth) < 1e-12 or np.std(opt_seg_full) < 1e-12:
+            seg_warnings.append(f"{segment_name}: Signal variance too low")
+            return 0.0, 0.0, 0, seg_warnings
+        
+        i_norm = (i_seg_smooth - np.mean(i_seg_smooth)) / np.std(i_seg_smooth)
+        opt_norm = (opt_seg_full - np.mean(opt_seg_full)) / np.std(opt_seg_full)
+        
+        # Apply segment mask (set non-segment to 0)
+        i_masked = i_norm * mask
+        opt_masked = opt_norm * mask
+        
+        # Re-normalize after masking for cleaner correlation
+        i_in_seg = i_norm[mask]
+        opt_in_seg = opt_norm[mask]
+        
+        if len(i_in_seg) < 10:
+            seg_warnings.append(f"{segment_name}: Too few points after mask")
+            return 0.0, 0.0, 0, seg_warnings
+        
+        # Normalize segment values
+        if np.std(i_in_seg) < 1e-12 or np.std(opt_in_seg) < 1e-12:
+            return 0.0, 0.0, 0, seg_warnings
+        
+        i_seg_norm = (i_in_seg - np.mean(i_in_seg)) / np.std(i_in_seg)
+        opt_seg_norm = (opt_in_seg - np.mean(opt_in_seg)) / np.std(opt_in_seg)
+        
+        # Cross-correlation over lag range using segment indices
+        n_lags = int(max_lag_s / dt)
+        lags = np.arange(-n_lags, n_lags + 1) * dt
+        correlations = []
+        
+        # Build segment-only arrays with full indexing
+        seg_indices = np.where(mask)[0]
+        
+        for lag_samples in range(-n_lags, n_lags + 1):
+            shifted_indices = seg_indices + lag_samples
+            valid = (shifted_indices >= 0) & (shifted_indices < len(i_norm))
+            
+            if valid.sum() < 10:
+                correlations.append(0.0)
+                continue
+            
+            i_vals = i_norm[seg_indices[valid]]
+            opt_vals = opt_norm[shifted_indices[valid]]
+            
+            corr = np.corrcoef(i_vals, opt_vals)[0, 1]
+            correlations.append(corr if np.isfinite(corr) else 0.0)
+        
+        correlations = np.array(correlations)
+        best_idx = np.argmax(correlations)
+        best_lag = float(lags[best_idx])
+        best_corr = float(correlations[best_idx])
+        
+        return best_lag, best_corr, int(mask.sum()), seg_warnings
     
-    for lag_samples in range(-n_lags, n_lags + 1):
-        if lag_samples >= 0:
-            i_seg = i_norm[lag_samples:]
-            opt_seg = opt_norm[:len(i_seg)]
+    # Determine which segments to use
+    results = {}
+    
+    if lag_signal_mode == "coloring_only":
+        lag, corr, n_pts, warns = _correlate_segment(coloring_mask, "coloring")
+        if n_pts < max(10, min_segment_fraction * len(t_common)):
+            meta["warnings"].append("Coloring segment insufficient; falling back to max_abs_corr")
+            lag_signal_mode = "max_abs_corr"
         else:
-            opt_seg = opt_norm[-lag_samples:]
-            i_seg = i_norm[:len(opt_seg)]
-        
-        if len(i_seg) < 10:
-            correlations.append(0.0)
-            continue
-        
-        corr = np.corrcoef(i_seg, opt_seg)[0, 1]
-        correlations.append(corr if np.isfinite(corr) else 0.0)
+            results["coloring"] = (lag, corr, n_pts, warns)
     
-    correlations = np.array(correlations)
-    best_idx = np.argmax(correlations)
-    best_lag = lags[best_idx]
-    best_corr = correlations[best_idx]
+    if lag_signal_mode == "bleaching_only":
+        lag, corr, n_pts, warns = _correlate_segment(bleaching_mask, "bleaching")
+        if n_pts < max(10, min_segment_fraction * len(t_common)):
+            meta["warnings"].append("Bleaching segment insufficient; falling back to max_abs_corr")
+            lag_signal_mode = "max_abs_corr"
+        else:
+            results["bleaching"] = (lag, corr, n_pts, warns)
     
-    # Confidence check
-    confident = best_corr > 0.3  # Reasonable threshold
+    if lag_signal_mode == "max_abs_corr":
+        # Try both segments and pick best
+        if "coloring" not in results:
+            lag_c, corr_c, n_c, w_c = _correlate_segment(coloring_mask, "coloring")
+            results["coloring"] = (lag_c, corr_c, n_c, w_c)
+        if "bleaching" not in results:
+            lag_b, corr_b, n_b, w_b = _correlate_segment(bleaching_mask, "bleaching")
+            results["bleaching"] = (lag_b, corr_b, n_b, w_b)
+    
+    if lag_signal_mode == "full_cycle":
+        # Legacy behavior - correlate full signal (may cancel!)
+        meta["warnings"].append("full_cycle mode may cause sign-cancellation in bidirectional data")
+        full_mask = np.ones(len(t_common), dtype=bool)
+        lag, corr, n_pts, warns = _correlate_segment(full_mask, "full_cycle")
+        results["full_cycle"] = (lag, corr, n_pts, warns)
+    
+    # Select best result
+    if not results:
+        meta["warnings"].append("No valid segments for correlation")
+        return 0.0, 0.0, False, meta
+    
+    best_segment = None
+    best_lag = 0.0
+    best_corr = 0.0
+    second_best_corr = None
+    
+    sorted_results = sorted(results.items(), key=lambda x: x[1][1], reverse=True)
+    
+    if len(sorted_results) >= 1:
+        best_segment = sorted_results[0][0]
+        best_lag, best_corr, n_pts, warns = sorted_results[0][1]
+        meta["warnings"].extend(warns)
+        meta["n_points_used"] = n_pts
+    
+    if len(sorted_results) >= 2:
+        second_best_corr = sorted_results[1][1][1]
+        meta["second_best_corr"] = float(second_best_corr)
+        meta["corr_margin"] = float(best_corr - second_best_corr)
+    
+    meta["segment_used"] = best_segment
+    meta["lag_signal_mode_used"] = lag_signal_mode
+    meta["best_corr"] = float(best_corr)
+    
+    # Confidence check - require good correlation AND margin if multiple segments
+    confident = best_corr > 0.3
+    if second_best_corr is not None and meta.get("corr_margin", 0) < 0.05:
+        confident = False
+        meta["warnings"].append(
+            f"Low margin between segments (Δr={meta.get('corr_margin', 0):.3f}); lag may be ambiguous"
+        )
     
     if not confident:
-        warnings.append(f"Low correlation ({best_corr:.3f}); lag estimate may be unreliable")
+        meta["warnings"].append(f"Low correlation ({best_corr:.3f}); lag estimate may be unreliable")
     
-    return float(best_lag), float(best_corr), confident, warnings
+    return float(best_lag), float(best_corr), confident, meta
 
 
 def align_ca_transmittance(
@@ -222,6 +380,7 @@ def align_ca_transmittance(
     lag_mode: Literal["estimate", "manual", "none"] = "none",
     max_lag_s: float = 10.0,
     manual_lag_s: float = 0.0,
+    lag_signal_mode: Literal["coloring_only", "bleaching_only", "max_abs_corr", "full_cycle"] = "coloring_only",
     direction: str = "optical_lags_current"
 ) -> Tuple[pd.DataFrame, Dict]:
     """
@@ -230,19 +389,31 @@ def align_ca_transmittance(
     Uses merge_asof for nearest-neighbor time matching.
     Optionally estimates and corrects trigger delay between instruments.
     
+    Lag Convention:
+        - direction="optical_lags_current" (default): positive lag_s means optical
+          data was recorded later than CA data. We shift optical time backward
+          (subtract lag_s) to align.
+        - manual_lag_s: Positive value = optical lags CA; subtract from optical time.
+    
     Args:
         ca_df: DataFrame with columns t_s, i_a (and optional v_v)
         tt_df: DataFrame with columns t_s, t_frac
         tolerance_s: Maximum time difference for matching
         lag_mode: "estimate" (auto), "manual" (user-provided), "none" (skip)
         max_lag_s: Maximum lag to search in estimate mode
-        manual_lag_s: User-provided lag in manual mode
-        direction: Lag direction convention
+        manual_lag_s: User-provided lag in manual mode (positive = optical lags CA)
+        lag_signal_mode: Segment used for auto lag estimation:
+            - "coloring_only": Use coloring segment (T decreases), default
+            - "bleaching_only": Use bleaching segment (T increases)
+            - "max_abs_corr": Try both, pick best correlation
+            - "full_cycle": Legacy (may cancel, not recommended)
+        direction: Lag direction convention (currently only "optical_lags_current" supported)
     
     Returns:
-        (merged_df, metadata)
+        (merged_df, metadata) where metadata includes align diagnostics
     """
-    warnings = []
+    warnings: List[str] = []
+    align_meta: Dict[str, Any] = {}
     
     # Ensure sorted
     ca_sorted = ca_df.sort_values("t_s").copy()
@@ -255,12 +426,15 @@ def align_ca_transmittance(
     lag_mode_used = lag_mode
     
     if lag_mode == "estimate":
-        lag_s, lag_correlation, lag_confident, lag_warnings = _estimate_time_lag(
+        lag_s, lag_correlation, lag_confident, est_meta = _estimate_time_lag(
             ca_sorted["t_s"].values, ca_sorted["i_a"].values,
             tt_sorted["t_s"].values, tt_sorted["t_frac"].values,
-            max_lag_s=max_lag_s
+            max_lag_s=max_lag_s,
+            lag_signal_mode=lag_signal_mode
         )
-        warnings.extend(lag_warnings)
+        # Extract warnings from estimation metadata
+        warnings.extend(est_meta.get("warnings", []))
+        align_meta["lag_estimation"] = est_meta
         
         if not lag_confident and abs(lag_s) > 0.5:
             warnings.append(f"Estimated lag {lag_s:.2f}s has low confidence; using 0")
@@ -271,9 +445,10 @@ def align_ca_transmittance(
         lag_s = manual_lag_s
     
     # Apply lag correction to optical time
+    # Convention: positive lag_s means optical lags CA, so we subtract lag_s
     if abs(lag_s) > 1e-6:
         tt_sorted = tt_sorted.copy()
-        tt_sorted["t_s"] = tt_sorted["t_s"] - lag_s  # Shift optical to align
+        tt_sorted["t_s"] = tt_sorted["t_s"] - lag_s  # Shift optical backward to align
     
     # Rename columns to avoid conflicts
     tt_sorted = tt_sorted.rename(columns={"t_s": "t_s_tt"})
@@ -295,9 +470,13 @@ def align_ca_transmittance(
         "tolerance_s": tolerance_s,
         "lag_mode": lag_mode,
         "lag_mode_used": lag_mode_used,
+        "lag_signal_mode": lag_signal_mode,
         "lag_s": lag_s,
+        "lag_direction_convention": direction,
+        "lag_shift_applied_to": "optical_time_subtracted",
         "lag_correlation": lag_correlation,
         "lag_confident": lag_confident,
+        "align_meta": align_meta,
         "warnings": warnings
     }
     
@@ -494,54 +673,135 @@ def compute_response_time(
 
 
 # =============================================================================
-# Charge Density
+# Charge Density with Leakage Correction
 # =============================================================================
 
 def compute_charge_density(
     t_s: np.ndarray, 
     i_a: np.ndarray, 
-    area_cm2: float
+    area_cm2: float,
+    baseline_mode: Literal["none", "offset_tail", "offset_head", "offset_both"] = "none",
+    tail_fraction: float = 0.2,
+    head_fraction: float = 0.1
 ) -> Dict[str, Any]:
     """
-    Compute charge density from current-time data.
+    Compute charge density from current-time data with optional leakage correction.
     
     Q = ∫I dt / area
     
     Uses numpy trapz for integration (no scipy dependency).
     
+    Leakage Correction (for GPE systems):
+        In GPE systems, leakage current causes Q to grow with time even after
+        optical plateau. This makes CE non-comparable across different test durations.
+        
+        - "offset_tail" (recommended for GPE): Estimate leakage as median current
+          in the last `tail_fraction` of segment (where optical change has stopped).
+          Subtract this baseline before integrating to get Q_effective.
+        
     Args:
         t_s: Time array in seconds
         i_a: Current array in A
         area_cm2: Electrode area in cm²
+        baseline_mode: Leakage correction mode
+            - "none": No correction (default, use for liquid electrolytes)
+            - "offset_tail": Subtract median of last tail_fraction (recommended for GPE)
+            - "offset_head": Subtract median of first head_fraction (rare, use if pre-step baseline)
+            - "offset_both": Average of head and tail medians
+        tail_fraction: Fraction of data for tail window (default 0.2)
+        head_fraction: Fraction of data for head window (default 0.1)
     
     Returns:
-        dict with q_c_cm2 (signed), q_abs_c_cm2, q_total_c, q_cumulative
+        dict with:
+            - q_c_cm2: Signed charge density (corrected if baseline_mode != "none")
+            - q_abs_c_cm2: Absolute charge density (corrected)
+            - q_c_cm2_raw: Raw signed charge density (before correction)
+            - q_abs_c_cm2_raw: Raw absolute charge density
+            - baseline_mode: Mode used
+            - i_baseline_A: Estimated baseline current (0 if mode="none")
+            - baseline_method: Description of correction applied
+            - q_total_c: Total charge in C (corrected)
+            - q_cumulative: Cumulative charge array (corrected)
     """
-    if len(t_s) < 2:
-        return {
-            "q_c_cm2": 0.0,
-            "q_abs_c_cm2": 0.0,
-            "q_total_c": 0.0,
-            "q_cumulative": np.array([0.0]),
-            "error": "Insufficient data points"
-        }
+    result: Dict[str, Any] = {
+        "q_c_cm2": 0.0,
+        "q_abs_c_cm2": 0.0,
+        "q_c_cm2_raw": 0.0,
+        "q_abs_c_cm2_raw": 0.0,
+        "q_total_c": 0.0,
+        "q_signed": 0.0,
+        "q_cumulative": np.array([0.0]),
+        "baseline_mode": baseline_mode,
+        "i_baseline_A": 0.0,
+        "baseline_method": "none",
+        "warnings": [],
+        "qc_flags": []
+    }
     
-    # Integrate using numpy trapz
-    q_total = float(np.trapz(i_a, t_s))
+    if len(t_s) < 2:
+        result["error"] = "Insufficient data points"
+        return result
+    
+    n = len(i_a)
+    i_corrected = i_a.copy()
+    i_baseline = 0.0
+    
+    # Apply baseline correction for leakage
+    if baseline_mode == "offset_tail":
+        n_tail = max(3, int(n * tail_fraction))
+        i_baseline = float(np.median(i_a[-n_tail:]))
+        i_corrected = i_a - i_baseline
+        result["baseline_method"] = f"offset_tail (last {tail_fraction*100:.0f}%, median={i_baseline:.2e} A)"
+        
+    elif baseline_mode == "offset_head":
+        n_head = max(3, int(n * head_fraction))
+        i_baseline = float(np.median(i_a[:n_head]))
+        i_corrected = i_a - i_baseline
+        result["baseline_method"] = f"offset_head (first {head_fraction*100:.0f}%, median={i_baseline:.2e} A)"
+        
+    elif baseline_mode == "offset_both":
+        n_tail = max(3, int(n * tail_fraction))
+        n_head = max(3, int(n * head_fraction))
+        i_tail = float(np.median(i_a[-n_tail:]))
+        i_head = float(np.median(i_a[:n_head]))
+        i_baseline = (i_tail + i_head) / 2
+        i_corrected = i_a - i_baseline
+        result["baseline_method"] = f"offset_both (avg of head={i_head:.2e}, tail={i_tail:.2e} A)"
+        
+    result["i_baseline_A"] = float(i_baseline)
+    
+    # Warn if baseline is significant
+    if baseline_mode != "none" and abs(i_baseline) > 0:
+        i_peak = np.max(np.abs(i_a))
+        if i_peak > 0 and abs(i_baseline) / i_peak > 0.1:
+            result["qc_flags"].append("high_leakage_ratio")
+            result["warnings"].append(
+                f"Leakage current is >{100*abs(i_baseline)/i_peak:.0f}% of peak current"
+            )
+    
+    # Integrate raw current
+    q_total_raw = _trapz(i_a, t_s)
+    q_density_raw = q_total_raw / area_cm2
+    
+    # Integrate corrected current
+    q_total = _trapz(i_corrected, t_s)
     q_density = q_total / area_cm2
     
-    # Cumulative charge for plotting
+    # Cumulative charge (corrected) for plotting
     q_cumulative = np.zeros(len(t_s))
     for i in range(1, len(t_s)):
-        q_cumulative[i] = q_cumulative[i-1] + np.trapz(i_a[i-1:i+1], t_s[i-1:i+1])
+        q_cumulative[i] = q_cumulative[i-1] + _trapz(i_corrected[i-1:i+1], t_s[i-1:i+1])
     
-    return {
-        "q_c_cm2": float(q_density),
-        "q_abs_c_cm2": float(abs(q_density)),
-        "q_total_c": q_total,
-        "q_signed": float(q_density),
-        "q_cumulative": q_cumulative
-    }
+    # Populate results
+    result["q_c_cm2_raw"] = float(q_density_raw)
+    result["q_abs_c_cm2_raw"] = float(abs(q_density_raw))
+    result["q_c_cm2"] = float(q_density)
+    result["q_abs_c_cm2"] = float(abs(q_density))
+    result["q_total_c"] = q_total
+    result["q_signed"] = float(q_density)
+    result["q_cumulative"] = q_cumulative
+    
+    return result
 
 
 # =============================================================================
@@ -640,9 +900,11 @@ def compute_coloration_efficiency(
     t_bleached: float, 
     t_colored: float,
     q_c_cm2: float,
+    q_c_cm2_raw: Optional[float] = None,
     step_type: Optional[str] = None,
     q_min_threshold: float = 1e-6,
-    force_compute: bool = False
+    force_compute: bool = False,
+    baseline_mode_used: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Compute coloration efficiency.
@@ -652,25 +914,38 @@ def compute_coloration_efficiency(
     
     By default, CE is only computed for coloring segments.
     
+    Leakage Correction:
+        When baseline_mode != "none" is used in compute_charge_density,
+        q_c_cm2 will be the corrected value and q_c_cm2_raw the uncorrected.
+        This function returns both ce_cm2_c (corrected) and ce_cm2_c_raw.
+    
     Args:
         t_bleached: Transmittance in bleached state [0, 1]
         t_colored: Transmittance in colored state [0, 1]
-        q_c_cm2: Charge density in C/cm² (use absolute value internally)
+        q_c_cm2: Charge density in C/cm² (corrected value if baseline correction used)
+        q_c_cm2_raw: Raw charge density in C/cm² (before baseline correction), optional
         step_type: "coloring", "bleaching", or None (auto-detect)
         q_min_threshold: Minimum |Q| to compute CE (prevents blowup)
         force_compute: If True, compute CE even for bleaching segments
+        baseline_mode_used: For metadata, describes correction applied
     
     Returns:
-        dict with ce_cm2_c (CE in cm²/C), delta_od, or ce_skipped_reason
+        dict with:
+            - ce_cm2_c: CE in cm²/C (using corrected Q)
+            - ce_cm2_c_raw: CE using raw Q (if q_c_cm2_raw provided)
+            - delta_od: Optical density change
+            - baseline_mode_used: Correction mode (for documentation)
+            - ce_skipped_reason: Why CE was not computed (if applicable)
     """
-    errors = []
-    warnings = []
+    errors: List[str] = []
+    warnings: List[str] = []
     
     # Validate inputs
     if t_colored <= 0:
         errors.append("T_colored must be > 0 for log calculation")
         return {
             "ce_cm2_c": None,
+            "ce_cm2_c_raw": None,
             "delta_od": None,
             "errors": errors,
             "warnings": warnings,
@@ -681,6 +956,7 @@ def compute_coloration_efficiency(
         errors.append("T_bleached must be > 0")
         return {
             "ce_cm2_c": None,
+            "ce_cm2_c_raw": None,
             "delta_od": None,
             "errors": errors,
             "warnings": warnings,
@@ -698,6 +974,7 @@ def compute_coloration_efficiency(
     if step_type == "bleaching" and not force_compute:
         return {
             "ce_cm2_c": None,
+            "ce_cm2_c_raw": None,
             "delta_od": float(delta_od),
             "step_type": step_type,
             "errors": errors,
@@ -708,6 +985,7 @@ def compute_coloration_efficiency(
     if step_type == "unknown" and not force_compute:
         return {
             "ce_cm2_c": None,
+            "ce_cm2_c_raw": None,
             "delta_od": float(delta_od),
             "step_type": step_type,
             "errors": errors,
@@ -715,11 +993,12 @@ def compute_coloration_efficiency(
             "ce_skipped_reason": "unknown_segment"
         }
     
-    # Check charge magnitude
+    # Check charge magnitude (corrected value)
     if abs(q_c_cm2) < q_min_threshold:
         warnings.append(f"Charge density near zero ({abs(q_c_cm2):.2e} C/cm²)")
         return {
             "ce_cm2_c": None,
+            "ce_cm2_c_raw": None,
             "delta_od": float(delta_od),
             "step_type": step_type,
             "errors": errors,
@@ -728,8 +1007,13 @@ def compute_coloration_efficiency(
             "q_abs_c_cm2": abs(q_c_cm2)
         }
     
-    # Compute CE
+    # Compute CE (corrected)
     ce = abs(delta_od) / abs(q_c_cm2)
+    
+    # Compute CE (raw) if raw Q provided
+    ce_raw = None
+    if q_c_cm2_raw is not None and abs(q_c_cm2_raw) >= q_min_threshold:
+        ce_raw = abs(delta_od) / abs(q_c_cm2_raw)
     
     # QC checks for CE value
     if ce < 10:
@@ -740,7 +1024,14 @@ def compute_coloration_efficiency(
     if t_bleached <= t_colored:
         warnings.append("T_bleached ≤ T_colored (unusual for coloring efficiency definition)")
     
-    return {
+    # Compare corrected vs raw CE
+    if ce_raw is not None and abs(ce - ce_raw) / max(ce, ce_raw, 1e-9) > 0.1:
+        warnings.append(
+            f"CE differs by >{10}% after baseline correction "
+            f"(raw={ce_raw:.1f}, corrected={ce:.1f})"
+        )
+    
+    result = {
         "ce_cm2_c": float(ce),
         "delta_od": float(delta_od),
         "log_base": 10,
@@ -750,6 +1041,16 @@ def compute_coloration_efficiency(
         "warnings": warnings,
         "ce_skipped_reason": None
     }
+    
+    # Add raw CE if available
+    if ce_raw is not None:
+        result["ce_cm2_c_raw"] = float(ce_raw)
+        result["q_used_c_cm2_raw"] = abs(q_c_cm2_raw) if q_c_cm2_raw else None
+    
+    if baseline_mode_used:
+        result["baseline_mode_used"] = baseline_mode_used
+    
+    return result
 
 
 # =============================================================================
@@ -1061,7 +1362,9 @@ def compute_cycling_metrics(
     area_cm2: float,
     response_threshold: float = 0.9,
     validate_plateau: bool = True,
-    auto_split_full_cycles: bool = True
+    auto_split_full_cycles: bool = True,
+    baseline_mode: Literal["none", "offset_tail", "offset_head", "offset_both"] = "none",
+    tail_fraction: float = 0.2
 ) -> pd.DataFrame:
     """
     Compute metrics for each cycle with comprehensive QC.
@@ -1075,10 +1378,18 @@ def compute_cycling_metrics(
         response_threshold: Threshold for response time (0.9 = 90%)
         validate_plateau: Check if plateau reached for response time
         auto_split_full_cycles: Split color+bleach cycles for correct CE
+        baseline_mode: Leakage correction mode for charge/CE
+            - "none": No correction (default)
+            - "offset_tail": Subtract tail median (recommended for GPE)
+        tail_fraction: Fraction of segment for tail (default 0.2)
     
     Returns:
         DataFrame with columns: cycle_num, segment_type, delta_t, ce_cm2_c, 
         q_c_cm2, response_time_s, qc_pass, reached_plateau, warnings
+        
+        When baseline_mode != "none", also includes:
+        - q_c_cm2_raw, ce_cm2_c_raw (uncorrected values)
+        - i_baseline_A (estimated leakage current)
     """
     results = []
     
@@ -1114,17 +1425,26 @@ def compute_cycling_metrics(
             t_min = float(np.min(seg_t_frac))
             delta_t = t_max - t_min
             
-            # Charge
-            q_result = compute_charge_density(seg_t_s, seg_i_a, area_cm2)
+            # Charge with optional baseline correction
+            q_result = compute_charge_density(
+                seg_t_s, seg_i_a, area_cm2,
+                baseline_mode=baseline_mode,
+                tail_fraction=tail_fraction
+            )
             q = q_result.get("q_abs_c_cm2", 0)
+            q_raw = q_result.get("q_abs_c_cm2_raw", q)
             q_signed = q_result.get("q_signed", 0)
+            i_baseline = q_result.get("i_baseline_A", 0.0)
             
-            # CE (only for coloring)
+            # CE (only for coloring, with raw Q for comparison)
             ce_result = compute_coloration_efficiency(
                 t_max, t_min, q, 
-                step_type=segment_type
+                q_c_cm2_raw=q_raw if baseline_mode != "none" else None,
+                step_type=segment_type,
+                baseline_mode_used=baseline_mode
             )
             ce = ce_result.get("ce_cm2_c")
+            ce_raw = ce_result.get("ce_cm2_c_raw")
             ce_skipped = ce_result.get("ce_skipped_reason")
             
             # Response time
@@ -1137,9 +1457,10 @@ def compute_cycling_metrics(
             reached_plateau = rt_result.get("reached_plateau", False)
             rt_qc = rt_result.get("qc_pass", True)
             
-            # Aggregate warnings
+            # Aggregate warnings (include charge warnings)
             all_warnings = (
                 step_info.get("warnings", []) + 
+                q_result.get("warnings", []) +
                 ce_result.get("warnings", []) + 
                 ce_result.get("errors", []) +
                 rt_result.get("warnings", [])
@@ -1157,7 +1478,7 @@ def compute_cycling_metrics(
             else:
                 cycle_label = str(cycle_num)
             
-            results.append({
+            row = {
                 "cycle_num": i + 1,
                 "cycle_label": cycle_label,
                 "segment_type": segment_type,
@@ -1170,8 +1491,17 @@ def compute_cycling_metrics(
                 "reached_plateau": reached_plateau,
                 "segment_was_split": seg.get("was_split", False),
                 "qc_pass": qc_pass,
-                "warnings": "; ".join(all_warnings) if all_warnings else None
-            })
+                "warnings": "; ".join(all_warnings) if all_warnings else None,
+                "baseline_mode": baseline_mode
+            }
+            
+            # Add raw values if baseline correction was applied
+            if baseline_mode != "none":
+                row["q_c_cm2_raw"] = q_raw
+                row["ce_cm2_c_raw"] = ce_raw
+                row["i_baseline_A"] = i_baseline
+            
+            results.append(row)
     
     df = pd.DataFrame(results)
     
@@ -1182,5 +1512,7 @@ def compute_cycling_metrics(
         df.attrs["n_coloring"] = int((df["segment_type"] == "coloring").sum())
         df.attrs["n_bleaching"] = int((df["segment_type"] == "bleaching").sum())
         df.attrs["pct_valid"] = float(df["qc_pass"].mean() * 100)
+        df.attrs["baseline_mode"] = baseline_mode
     
     return df
+

@@ -484,6 +484,21 @@ def rc_impedance(freq: np.ndarray, r: float, c: float) -> Tuple[np.ndarray, np.n
     return z_re, z_im
 
 
+def rcpe_impedance(freq: np.ndarray, r: float, q: float, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate impedance of parallel R || CPE circuit.
+    
+    Z = 1 / (1/R + Q*(j*ω)^alpha)
+    
+    Returns (z_re, z_im) where z_im is NEGATIVE for capacitive behavior.
+    """
+    omega = 2 * np.pi * freq
+    jw_alpha = (1j * omega) ** alpha
+    admittance = (1 / r) + q * jw_alpha
+    z = 1 / admittance
+    return np.real(z), np.imag(z)
+
+
 def randles_impedance(
     freq: np.ndarray, 
     rs: float, 
@@ -548,16 +563,161 @@ def _detect_diffusion_tail(z_re: np.ndarray, z_im: np.ndarray, freq: np.ndarray)
     return is_diffusion
 
 
+def _prepare_hf_fit_data(
+    freq: np.ndarray,
+    z_re: np.ndarray,
+    z_im: np.ndarray,
+    hf_decades: float,
+    exclude_diffusion: bool,
+    min_points: int = 6
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Dict[str, Any]]:
+    """
+    Prepare HF data for RC fitting.
+    
+    Pipeline:
+    (1) finite filter -> (2) sign standardization -> (3) diffusion mask
+    -> (4) drop HF inductive points -> (5) select HF band -> (6) sanity checks
+    """
+    meta = {
+        "sign_was_flipped": False,
+        "sign_warning": "",
+        "n_inductive_dropped": 0,
+        "inductive_warning": "",
+        "hf_decades_used": float(hf_decades),
+        "n_points_after_filters": 0,
+        "warnings": []
+    }
+    
+    freq = np.asarray(freq, dtype=float)
+    z_re = np.asarray(z_re, dtype=float)
+    z_im = np.asarray(z_im, dtype=float)
+    
+    if freq.shape != z_re.shape or freq.shape != z_im.shape:
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": "Input arrays must have the same shape"
+        }
+    
+    finite_mask = np.isfinite(freq) & np.isfinite(z_re) & np.isfinite(z_im)
+    n_nonfinite = int(np.sum(~finite_mask))
+    if n_nonfinite > 0:
+        meta["warnings"].append(f"Dropped {n_nonfinite} non-finite points")
+    
+    freq = freq[finite_mask]
+    z_re = z_re[finite_mask]
+    z_im = z_im[finite_mask]
+    
+    if len(freq) < min_points:
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": f"Insufficient data points after filtering ({len(freq)} < {min_points})"
+        }
+    
+    if np.any(freq <= 0):
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": "Frequency must be > 0 Hz"
+        }
+    
+    # Standardize sign to capacitive-negative
+    z_im_cap, was_flipped, sign_warning = _standardize_sign_capacitive(z_im, freq)
+    meta["sign_was_flipped"] = was_flipped
+    meta["sign_warning"] = sign_warning
+    if sign_warning:
+        meta["warnings"].append(sign_warning)
+    
+    # Exclude diffusion tail if requested
+    if exclude_diffusion:
+        diffusion_mask = _detect_diffusion_tail(z_re, z_im_cap, freq)
+        keep_mask = ~diffusion_mask
+    else:
+        keep_mask = np.ones(len(freq), dtype=bool)
+    
+    z_re = z_re[keep_mask]
+    z_im_cap = z_im_cap[keep_mask]
+    freq = freq[keep_mask]
+    
+    if len(freq) < min_points:
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": f"Insufficient data points after diffusion filtering ({len(freq)} < {min_points})"
+        }
+    
+    # Drop consecutive HF inductive points (>0 in capacitive convention)
+    z_re_clean, z_im_clean, freq_clean, n_drop, inductive_warning = _drop_hf_inductive_points(
+        z_re, z_im_cap, freq
+    )
+    if n_drop > 0:
+        meta["n_inductive_dropped"] += int(n_drop)
+    if inductive_warning:
+        meta["inductive_warning"] = inductive_warning
+        meta["warnings"].append(inductive_warning)
+    
+    # Select HF band
+    z_re_hf, z_im_hf, freq_hf = _select_hf_band(
+        z_re_clean, z_im_clean, freq_clean,
+        decades=hf_decades, min_points=min_points
+    )
+    
+    if len(freq_hf) == 0:
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": "No HF points available after filtering"
+        }
+    
+    # Drop any remaining inductive points (beyond tolerance)
+    z_im_scale = np.max(np.abs(z_im_hf)) if len(z_im_hf) > 0 else 0.0
+    tol = max(1e-9, 1e-6 * max(1.0, z_im_scale))
+    inductive_mask = z_im_hf > tol
+    
+    if np.any(inductive_mask):
+        n_more = int(np.sum(inductive_mask))
+        z_re_hf = z_re_hf[~inductive_mask]
+        z_im_hf = z_im_hf[~inductive_mask]
+        freq_hf = freq_hf[~inductive_mask]
+        meta["n_inductive_dropped"] += n_more
+        
+        warning_msg = f"Dropped {n_more} inductive HF points after selection"
+        meta["warnings"].append(warning_msg)
+        if meta["inductive_warning"]:
+            meta["inductive_warning"] = f"{meta['inductive_warning']}; {warning_msg}"
+        else:
+            meta["inductive_warning"] = warning_msg
+    
+    if len(freq_hf) == 0:
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": "No HF points left after inductive filtering"
+        }
+    
+    if np.any(z_im_hf > tol):
+        return None, None, None, {
+            **meta,
+            "success": False,
+            "error": "Inductive points remain in HF band after filtering"
+        }
+    
+    meta["n_points_after_filters"] = int(len(freq_hf))
+    return z_re_hf, z_im_hf, freq_hf, meta
+
+
 def fit_simple_rc(
     freq: np.ndarray, 
     z_re: np.ndarray, 
     z_im: np.ndarray,
     rs_init: Optional[float] = None,
     hf_decades: float = 1.5,
-    exclude_diffusion: bool = True
+    exclude_diffusion: bool = True,
+    model: str = "rc"
 ) -> Dict[str, Any]:
     """
-    Fit a simple Rs + (R || C) circuit to HIGH-FREQUENCY EIS data only.
+    Fit a simple equivalent circuit to HIGH-FREQUENCY EIS data only.
     
     WARNING: This fit is only valid for the HF semicircle in SS/GPE/SS cells.
     It does NOT model Warburg diffusion or blocking electrode effects.
@@ -570,9 +730,13 @@ def fit_simple_rc(
         rs_init: Initial guess for Rs (auto-detected if None)
         hf_decades: Number of decades from fmax for HF band (default 1.5)
         exclude_diffusion: If True, auto-detect and exclude LF diffusion tail
+        model: "rc" (Rs + R||C) or "rc_cpe" (Rs + R||CPE)
     
     Returns:
-        dict with Rs (bulk resistance), R, C, r_squared, and fit metadata
+        dict with Rs (bulk resistance), R, and:
+        - C_F for model="rc"
+        - Q_Ss_alpha and alpha for model="rc_cpe"
+        plus r_squared and fit metadata
     """
     if not SCIPY_AVAILABLE:
         return {
@@ -586,21 +750,32 @@ def fit_simple_rc(
             "error": "Insufficient data points (need >= 6)"
         }
     
-    # Standardize sign to capacitive-negative
-    z_im_cap, was_flipped, _ = _standardize_sign_capacitive(z_im, freq)
+    if model not in {"rc", "rc_cpe"}:
+        return {
+            "success": False,
+            "error": f"Unknown model '{model}'. Use 'rc' or 'rc_cpe'."
+        }
     
-    # Exclude diffusion tail if requested
-    if exclude_diffusion:
-        diffusion_mask = _detect_diffusion_tail(z_re, z_im_cap, freq)
-        keep_mask = ~diffusion_mask
-    else:
-        keep_mask = np.ones(len(freq), dtype=bool)
-    
-    # Select HF band
-    z_re_hf, z_im_hf, freq_hf = _select_hf_band(
-        z_re[keep_mask], z_im_cap[keep_mask], freq[keep_mask], 
-        decades=hf_decades, min_points=6
+    z_re_hf, z_im_hf, freq_hf, meta = _prepare_hf_fit_data(
+        freq=freq,
+        z_re=z_re,
+        z_im=z_im,
+        hf_decades=hf_decades,
+        exclude_diffusion=exclude_diffusion,
+        min_points=6
     )
+    
+    if meta.get("success") is False:
+        return {
+            "success": False,
+            "error": meta.get("error", "HF data preparation failed"),
+            "warnings": meta.get("warnings", []),
+            "sign_was_flipped": meta.get("sign_was_flipped", False),
+            "inductive_warning": meta.get("inductive_warning", ""),
+            "n_inductive_dropped": meta.get("n_inductive_dropped", 0),
+            "hf_decades_used": meta.get("hf_decades_used", hf_decades),
+            "n_points_after_filters": meta.get("n_points_after_filters", 0)
+        }
     
     if len(freq_hf) < 4:
         return {
@@ -612,30 +787,58 @@ def fit_simple_rc(
     if rs_init is None:
         rs_init = find_hf_intercept_direct(z_re_hf, z_im_hf, freq_hf) or np.min(z_re_hf)
     
-    def model(f, rs, r, c):
-        z_re_calc, z_im_calc = rc_impedance(f, r, c)
-        return np.concatenate([rs + z_re_calc, z_im_calc])
-    
-    # Initial guesses
     r_init = max(1.0, np.max(z_re_hf) - rs_init)
-    c_init = 1e-6  # 1 µF typical
     
-    # Widen C bounds for high-area gels (up to 10 mF)
-    c_max = 1e-2
+    # Model selection
+    if model == "rc":
+        def model_fn(f, rs, r, c):
+            z_re_calc, z_im_calc = rc_impedance(f, r, c)
+            return np.concatenate([rs + z_re_calc, z_im_calc])
+        
+        # Initial guesses
+        c_init = 1e-6  # 1 µF typical
+        
+        # Widen C bounds for high-area gels (up to 10 mF)
+        c_max = 1e-2
+        bounds = ([0, 0, 1e-12], [np.inf, np.inf, c_max])
+        p0 = [rs_init, r_init, c_init]
+    else:
+        def model_fn(f, rs, r, q, alpha):
+            z_re_calc, z_im_calc = rcpe_impedance(f, r, q, alpha)
+            return np.concatenate([rs + z_re_calc, z_im_calc])
+        
+        alpha_init = 0.9
+        f_ref = float(np.median(freq_hf))
+        omega_ref = 2 * np.pi * f_ref
+        c_init = 1e-6
+        q_init = c_init * (omega_ref ** (1 - alpha_init))
+        q_init = float(np.clip(q_init, 1e-12, 1e0))
+        
+        bounds = ([0, 0, 1e-12, 0.2], [np.inf, np.inf, 1e0, 1.0])
+        p0 = [rs_init, r_init, q_init, alpha_init]
     
     try:
         z_data = np.concatenate([z_re_hf, z_im_hf])
         popt, pcov = curve_fit(
-            model, freq_hf, z_data,
-            p0=[rs_init, r_init, c_init],
-            bounds=([0, 0, 1e-12], [np.inf, np.inf, c_max]),
+            model_fn, freq_hf, z_data,
+            p0=p0,
+            bounds=bounds,
             maxfev=5000
         )
         
-        rs, r, c = popt
+        rs = float(popt[0])
+        r = float(popt[1])
+        c = None
+        q = None
+        alpha = None
+        if model == "rc":
+            c = float(popt[2])
+        else:
+            q = float(popt[2])
+            alpha = float(popt[3])
         
         # Calculate fit quality with safeguard
-        z_fit = model(freq_hf, rs, r, c)
+        z_fit = model_fn(freq_hf, *popt)
         ss_res = np.sum((z_data - z_fit) ** 2)
         ss_tot = np.sum((z_data - np.mean(z_data)) ** 2)
         
@@ -645,23 +848,36 @@ def fit_simple_rc(
             r_squared = 1 - ss_res / ss_tot
         
         # Warn if C near bounds
-        warnings = []
-        if c > c_max * 0.9:
-            warnings.append(f"C near upper bound ({c:.2e} F ≈ {c_max:.0e} F limit)")
-        if c < 1e-11:
-            warnings.append(f"C near lower bound ({c:.2e} F)")
+        warnings = list(meta.get("warnings", []))
+        if model == "rc":
+            if c > c_max * 0.9:
+                warnings.append(f"C near upper bound ({c:.2e} F ≈ {c_max:.0e} F limit)")
+            if c < 1e-11:
+                warnings.append(f"C near lower bound ({c:.2e} F)")
         
-        return {
-            "Rs_ohm": float(rs),
-            "R_ohm": float(r),
-            "C_F": float(c),
+        result = {
+            "Rs_ohm": rs,
+            "R_ohm": r,
             "r_squared": float(r_squared) if not np.isnan(r_squared) else None,
             "success": True,
             "n_points_fitted": len(freq_hf),
             "hf_only": True,
             "warnings": warnings,
-            "note": "HF semicircle fit only; not valid for diffusion/Warburg analysis"
+            "note": "HF semicircle fit only; not valid for diffusion/Warburg analysis",
+            "sign_was_flipped": meta.get("sign_was_flipped", False),
+            "inductive_warning": meta.get("inductive_warning", ""),
+            "n_inductive_dropped": meta.get("n_inductive_dropped", 0),
+            "hf_decades_used": meta.get("hf_decades_used", hf_decades),
+            "n_points_after_filters": meta.get("n_points_after_filters", len(freq_hf))
         }
+        
+        if model == "rc":
+            result["C_F"] = c
+        else:
+            result["Q_Ss_alpha"] = q
+            result["alpha"] = alpha
+        
+        return result
     except Exception as e:
         return {
             "success": False,

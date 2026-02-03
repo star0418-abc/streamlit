@@ -2,9 +2,10 @@
 UI Header Utilities for GPE Lab
 
 Provides reusable UI components for consistent page headers.
+
+IMPORTANT: This module does NOT call st.* at import time.
+All Streamlit calls happen inside function bodies.
 """
-import streamlit as st
-from utils.i18n import t
 
 
 def render_top_banner() -> None:
@@ -12,17 +13,23 @@ def render_top_banner() -> None:
     Render the founder/maintainer banner at the top of the page.
     
     This banner displays institutional affiliation information in a clean,
-    journal-style format. It should be called after init_language() and
-    before the page title on every page.
+    journal-style format. It should be called after st.set_page_config() and
+    init_language() on every page.
     
     The banner uses i18n keys:
     - common.founder_label / common.founder_value
     - common.maintainer_label / common.maintainer_value
+    
+    SAFETY: All imports are inside the function to avoid import-time st.* calls.
     """
-    founder_label = t("common.founder_label")
-    founder_value = t("common.founder_value")
-    maintainer_label = t("common.maintainer_label")
-    maintainer_value = t("common.maintainer_value")
+    # Lazy import to avoid import-time Streamlit calls
+    import streamlit as st
+    from utils.i18n import t
+    
+    founder_label = t("common.founder_label", default="Founder")
+    founder_value = t("common.founder_value", default="USTC-NSRL")
+    maintainer_label = t("common.maintainer_label", default="Maintainer")
+    maintainer_value = t("common.maintainer_value", default="HENU")
     
     # Clean, journal-style banner with safe inline CSS
     # - Small caption-like font (0.85rem)

@@ -2,10 +2,13 @@
 GPE Lab - Gel Polymer Electrolyte & Smart Window Analysis Platform
 
 Main entry point for the Streamlit multi-page application.
-"""
-import streamlit as st
 
-# Bootstrap project path (must be first, before other local imports)
+ROBUSTNESS DESIGN:
+- st.set_page_config is the FIRST Streamlit command
+- All critical imports are wrapped in try/except
+- The app renders even if i18n/header fails (shows warning banner)
+- Navigation is data-driven from utils/pages.py
+"""
 import sys
 from pathlib import Path
 
@@ -14,12 +17,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Now import local modules
-from utils.i18n import t, init_language, language_selector
-from utils.version import get_app_version
-from utils.ui_header import render_top_banner
+# === STREAMLIT IMPORT AND PAGE CONFIG (MUST BE FIRST) ===
+import streamlit as st
 
-__version__ = get_app_version()
+# Version retrieval - pure function, no st.* calls
+try:
+    from utils.version import get_app_version
+    __version__ = get_app_version()
+except Exception:
+    __version__ = "0.0.0"
 
 st.set_page_config(
     page_title="GPE Lab",
@@ -28,30 +34,109 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize language and add selector to sidebar
+# === CSS FALLBACK: Hide default sidebar nav for older Streamlit versions ===
+# config.toml has showSidebarNavigation=false, but older versions ignore it
+st.markdown(
+    """
+    <style>
+    [data-testid="stSidebarNav"] { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# === SAFE IMPORTS WITH FALLBACKS ===
+_IMPORT_WARNINGS: list[str] = []
+_I18N_AVAILABLE = False
+_HEADER_AVAILABLE = False
+_PAGES_AVAILABLE = False
+
+# Import i18n with fallback
+try:
+    from utils.i18n import t, init_language, language_selector, is_fallback_active
+    _I18N_AVAILABLE = True
+except Exception as e:
+    _IMPORT_WARNINGS.append(f"i18n module failed: {e}")
+    # Fallback t() function
+    def t(key: str, default: str | None = None, **kwargs) -> str:
+        return default if default else key
+    def init_language() -> None:
+        pass
+    def language_selector() -> None:
+        st.sidebar.caption("Language: English (fallback)")
+    def is_fallback_active() -> bool:
+        return True
+
+# Import UI header with fallback
+try:
+    from utils.ui_header import render_top_banner
+    _HEADER_AVAILABLE = True
+except Exception as e:
+    _IMPORT_WARNINGS.append(f"ui_header module failed: {e}")
+    def render_top_banner() -> None:
+        pass  # Silently skip banner
+
+# Import page registry with fallback
+try:
+    from utils.pages import NAV_PAGES, get_pages_by_section
+    _PAGES_AVAILABLE = True
+except Exception as e:
+    _IMPORT_WARNINGS.append(f"pages module failed: {e}")
+    # Minimal fallback page registry
+    from typing import NamedTuple
+    class PageDef(NamedTuple):
+        id: str
+        path: str
+        icon: str
+        section: str
+    NAV_PAGES = (
+        PageDef("import", "pages/1_📊_Import_Data.py", "📊", "a"),
+    )
+    def get_pages_by_section(section: str) -> list:
+        return [p for p in NAV_PAGES if p.section == section]
+
+# === INITIALIZE LANGUAGE ===
 init_language()
 
-# Render top banner (founder/maintainer info)
+# === RENDER HEADER (safe) ===
 render_top_banner()
 
-# Sidebar with language selector at top
+# === SIDEBAR ===
 with st.sidebar:
     language_selector()
     st.markdown("---")
     st.caption(f"GPE Lab v{__version__}")
 
-# ----- Home Page Title -----
-st.title(t("home.title"))
-st.markdown(f"**{t('home.subtitle')}**")
-st.markdown(t("home.welcome"))
+# === WARNING BANNERS ===
+# Show warnings if we're in fallback mode
+if _IMPORT_WARNINGS:
+    with st.expander("⚠️ Initialization Warnings", expanded=True):
+        for warning in _IMPORT_WARNINGS:
+            st.warning(warning)
+        st.info("The app is running in fallback mode. Some features may be limited.")
 
-# ----- Navigation Dashboard -----
+if _I18N_AVAILABLE and is_fallback_active():
+    st.warning(t("warnings.i18n_fallback", default="⚠️ Translation files failed to load. Using fallback English."))
+
+# === HOME PAGE CONTENT ===
+st.title(t("home.title", default="🔬 GPE Lab"))
+st.markdown(f"**{t('home.subtitle', default='Gel Polymer Electrolyte & Smart Window Analysis Platform')}**")
+st.markdown(t("home.welcome", default="Welcome to GPE Lab. Use the navigation below to access modules:"))
+
+# === NAVIGATION DASHBOARD ===
 # Check for st.page_link availability (Streamlit >= 1.31)
 _HAS_PAGE_LINK = hasattr(st, "page_link")
 
 
-def _render_nav_card(icon: str, title: str, description: str, page_path: str) -> None:
-    """Render a navigation card with icon, title, and link."""
+def _render_nav_card(page_id: str, icon: str, page_path: str) -> None:
+    """Render a navigation card with icon, title, and link.
+    
+    Uses structured i18n keys: home.nav.<page_id>.title and home.nav.<page_id>.desc
+    """
+    title = t(f"home.nav.{page_id}.title", default=page_id.replace("_", " ").title())
+    desc = t(f"home.nav.{page_id}.desc", default="")
+    nav_label = t("common.navigate", default="Go")
+    
     with st.container():
         st.markdown(
             f"""
@@ -65,89 +150,48 @@ def _render_nav_card(icon: str, title: str, description: str, page_path: str) ->
             ">
                 <span style="font-size: 1.5rem;">{icon}</span>
                 <strong style="margin-left: 0.5rem;">{title}</strong>
-                <div style="color: #888; font-size: 0.9rem; margin-top: 0.3rem;">{description}</div>
+                <div style="color: #888; font-size: 0.9rem; margin-top: 0.3rem;">{desc}</div>
             </div>
             """,
             unsafe_allow_html=True
         )
         if _HAS_PAGE_LINK:
-            st.page_link(page_path, label=f"➡️ {t('common.navigate') if 'common.navigate' in t('common.navigate') else 'Go'}", use_container_width=True)
+            st.page_link(page_path, label=f"➡️ {nav_label}", use_container_width=True)
         else:
             # Fallback for older Streamlit: show path hint
             st.caption(f"📂 {page_path}")
 
 
-# Module A: GPE Electrochem Calculator
-st.markdown(f"### {t('home.module_a')}")
-col_a1, col_a2 = st.columns(2)
-
-with col_a1:
-    with st.container(border=True):
-        st.markdown("📊 **" + t("home.module_a_import").replace("**📊 ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/1_📊_Import_Data.py", label="➡️ " + t("home.module_a_import").split(":")[0].replace("**", "").strip(), use_container_width=True)
+def _render_section(section_key: str, section_i18n_key: str, columns: int = 2) -> None:
+    """Render a navigation section with its pages."""
+    st.markdown(f"### {t(f'home.{section_i18n_key}', default=section_key.upper())}")
+    pages = get_pages_by_section(section_key)
     
-    with st.container(border=True):
-        st.markdown("🌡️ **" + t("home.module_a_temp").replace("**🌡️ ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/3_🌡️_Temperature_Fits.py", label="➡️ " + t("home.module_a_temp").split(":")[0].replace("**", "").strip(), use_container_width=True)
+    if not pages:
+        return
     
-    with st.container(border=True):
-        st.markdown("📈 **" + t("home.module_a_lsv").replace("**📈 ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/5_📈_Stability_Window.py", label="➡️ " + t("home.module_a_lsv").split(":")[0].replace("**", "").strip(), use_container_width=True)
+    if columns == 1 or len(pages) == 1:
+        for page in pages:
+            with st.container(border=True):
+                _render_nav_card(page.id, page.icon, page.path)
+    else:
+        cols = st.columns(columns)
+        for i, page in enumerate(pages):
+            with cols[i % columns]:
+                with st.container(border=True):
+                    _render_nav_card(page.id, page.icon, page.path)
 
-with col_a2:
-    with st.container(border=True):
-        st.markdown("⚡ **" + t("home.module_a_eis").replace("**⚡ ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/2_⚡_EIS_Conductivity.py", label="➡️ " + t("home.module_a_eis").split(":")[0].replace("**", "").strip(), use_container_width=True)
-    
-    with st.container(border=True):
-        st.markdown("🔋 **" + t("home.module_a_trans").replace("**🔋 ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/4_🔋_Transference.py", label="➡️ " + t("home.module_a_trans").split(":")[0].replace("**", "").strip(), use_container_width=True)
 
-# Module B: Smart Window Analysis
-st.markdown(f"### {t('home.module_b')}")
-with st.container(border=True):
-    st.markdown("🪟 **" + t("home.module_b_sw").replace("**🪟 ", "").replace("**", "") + "**")
-    if _HAS_PAGE_LINK:
-        st.page_link("pages/6_🪟_Smart_Window.py", label="➡️ " + t("home.module_b_sw").split(":")[0].replace("**", "").strip(), use_container_width=True)
-
-# Module C: Lab Database
-st.markdown(f"### {t('home.module_c')}")
-col_c1, col_c2, col_c3 = st.columns(3)
-
-with col_c1:
-    with st.container(border=True):
-        st.markdown("🗃️ **" + t("home.module_c_db").replace("**🗃️ ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/7_🗃️_Lab_Database.py", label="➡️ " + t("home.module_c_db").split(":")[0].replace("**", "").strip(), use_container_width=True)
-
-with col_c2:
-    with st.container(border=True):
-        st.markdown("📉 **" + t("home.module_c_analytics").replace("**📉 ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/8_📉_Analytics.py", label="➡️ " + t("home.module_c_analytics").split(":")[0].replace("**", "").strip(), use_container_width=True)
-
-with col_c3:
-    with st.container(border=True):
-        st.markdown("📝 **" + t("home.module_c_reports").replace("**📝 ", "").replace("**", "") + "**")
-        if _HAS_PAGE_LINK:
-            st.page_link("pages/9_📝_Reports.py", label="➡️ " + t("home.module_c_reports").split(":")[0].replace("**", "").strip(), use_container_width=True)
-
-# Changelog
-st.markdown(f"### {t('home.module_changelog')}")
-with st.container(border=True):
-    st.markdown("📋 **" + t("home.module_changelog").replace("**📋 ", "").replace("**", "") + "**")
-    if _HAS_PAGE_LINK:
-        st.page_link("pages/10_📋_Update_Report.py", label="➡️ " + t("changelog.title"), use_container_width=True)
+# === RENDER ALL SECTIONS ===
+_render_section("a", "module_a", columns=2)
+_render_section("b", "module_b", columns=1)
+_render_section("c", "module_c", columns=3)
+_render_section("changelog", "module_changelog", columns=1)
 
 st.markdown("---")
-st.caption(f"*{t('common.version')} {__version__}*")
+st.caption(f"*{t('common.version', default='Version')} {__version__}*")
 
-# ----- Environment Check Section (runs only on button click) -----
+# === ENVIRONMENT CHECK SECTION (lazy, runs only on button click) ===
 with st.expander("🔧 环境检查 / Environment Check"):
     st.markdown("### 依赖状态 / Dependency Status")
     st.info("💡 点击下方按钮运行诊断 / Click the button below to run diagnostics")

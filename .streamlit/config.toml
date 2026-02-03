@@ -1,1 +1,4 @@
-
+# GPE Lab Streamlit Configuration
+# Disable auto-generated sidebar navigation (we use custom card navigation)
+[client]
+showSidebarNavigation = false

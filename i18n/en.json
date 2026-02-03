@@ -32,18 +32,51 @@
         "subtitle": "Gel Polymer Electrolyte & Smart Window Analysis Platform",
         "welcome": "Welcome to the GPE Lab application. Use the sidebar to navigate between modules:",
         "module_a": "Module A: GPE Electrochem Calculator",
-        "module_a_import": "**📊 Import Data**: Upload and map data files",
-        "module_a_eis": "**⚡ EIS Conductivity**: Calculate ionic conductivity from impedance",
-        "module_a_temp": "**🌡️ Temperature Fits**: Arrhenius and VFT analysis",
-        "module_a_trans": "**🔋 Transference**: Li+ transference number (tLi+)",
-        "module_a_lsv": "**📈 Stability Window**: Electrochemical stability from LSV",
         "module_b": "Module B: Smart Window Analysis",
-        "module_b_sw": "**🪟 Smart Window**: ΔT, response time, coloration efficiency (CE)",
         "module_c": "Module C: Lab Database",
-        "module_c_db": "**🗃️ Lab Database**: Recipes, batches, samples management",
-        "module_c_analytics": "**📉 Analytics**: Trends and composition analysis",
-        "module_c_reports": "**📝 Reports**: Export measurement reports",
-        "module_changelog": "**📋 Update Report**: View version changelog"
+        "module_changelog": "Update Report",
+        "nav": {
+            "import": {
+                "title": "Import Data",
+                "desc": "Upload and map data files"
+            },
+            "eis": {
+                "title": "EIS Conductivity",
+                "desc": "Calculate ionic conductivity from impedance"
+            },
+            "temp_fits": {
+                "title": "Temperature Fits",
+                "desc": "Arrhenius and VFT analysis"
+            },
+            "transference": {
+                "title": "Transference",
+                "desc": "Li+ transference number (tLi+)"
+            },
+            "stability": {
+                "title": "Stability Window",
+                "desc": "Electrochemical stability from LSV"
+            },
+            "smart_window": {
+                "title": "Smart Window",
+                "desc": "ΔT, response time, coloration efficiency (CE)"
+            },
+            "database": {
+                "title": "Lab Database",
+                "desc": "Recipes, batches, samples management"
+            },
+            "analytics": {
+                "title": "Analytics",
+                "desc": "Trends and composition analysis"
+            },
+            "reports": {
+                "title": "Reports",
+                "desc": "Export measurement reports"
+            },
+            "changelog": {
+                "title": "Update Report",
+                "desc": "View version changelog"
+            }
+        }
     },
     "import": {
         "page_title": "Import Data - GPE Lab",

@@ -7,18 +7,24 @@ SIGN CONVENTION:
 
 I0 EXTRACTION:
 - Excludes initial capacitive charging spike (auto-detected via derivative)
-- Uses median of early-time window after transient settling
+- Uses early-biased estimator within post-transient window to avoid Cottrell-decay bias
+- Configurable via `i0_method`: "early_median" (default), "legacy_median", "early_quantile", "first_point"
 
 Iss EXTRACTION:
-- Detects steady-state via derivative analysis on tail
+- Detects steady-state via derivative analysis on tail USING TAIL SCALE (not global median)
 - If steady not detected, returns approximate Iss with qc_pass=False
+
+RESISTANCE REQUIREMENTS (CRITICAL):
+- R0 and Rss must be INTERFACIAL resistance (R_ct + R_SEI), NOT bulk electrolyte Rb
+- Using Rb instead of R_interface will severely bias tLi+ (usually upward)
+- Extract R_interface from EIS: high-frequency semicircle intercepts, not the HF real-axis intercept
 
 STRICT MODE:
 - strict=True (default): Fails hard on invalid inputs
 - strict=False: Returns qc_pass=False with warnings, attempts computation where safe
 """
 import numpy as np
-from typing import Dict, Any, List, Literal, Tuple
+from typing import Dict, Any, List, Literal, Tuple, Optional
 
 
 # =============================================================================
@@ -68,13 +74,43 @@ def _compute_derivative(
     dt_median = np.median(dt) if len(dt) > 0 else 1.0
     
     # Avoid division by zero
-    dt_safe = np.where(np.abs(dt) < 1e-12, 1e-12, dt)
+    eps = 1e-12
+    dt_safe = np.where(np.abs(dt) < eps, eps, dt)
     
     # Derivative (one fewer point than input)
     dy = np.diff(y_smooth)
     derivative = dy / dt_safe
     
     return derivative, dt_median
+
+
+def _deduplicate_time_series(
+    t: np.ndarray, 
+    i: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Deduplicate time series by grouping identical timestamps and taking median of i.
+    
+    Returns (t_deduped, i_deduped, n_merged).
+    """
+    if len(t) == 0:
+        return t, i, 0
+    
+    unique_t, inverse_indices, counts = np.unique(t, return_inverse=True, return_counts=True)
+    
+    if len(unique_t) == len(t):
+        # No duplicates
+        return t, i, 0
+    
+    # There are duplicates - aggregate by median
+    n_merged = len(t) - len(unique_t)
+    i_deduped = np.zeros(len(unique_t), dtype=float)
+    
+    for idx in range(len(unique_t)):
+        mask = (inverse_indices == idx)
+        i_deduped[idx] = np.median(i[mask])
+    
+    return unique_t, i_deduped, n_merged
 
 
 # =============================================================================
@@ -93,10 +129,15 @@ def extract_currents_from_chrono(
     di_dt_tol_rel: float = 0.02,
     i0_window_fraction: float = 0.01,
     i0_min_points: int = 5,
+    i0_method: Literal["early_median", "legacy_median", "early_quantile", "first_point"] = "early_median",
+    i0_early_quantile: float = 0.85,
+    i0_decay_threshold: float = 0.8,
     tail_fraction: float = 0.2,
     tail_min_points: int = 20,
     ss_di_dt_tol_rel: float = 0.01,
-    ss_min_consecutive: int = 10
+    ss_min_consecutive: int = 10,
+    ss_flatness_tol: float = 0.15,
+    min_transient_points: int = 3
 ) -> Dict[str, Any]:
     """
     Extract I0 and Iss from chronoamperometry data with robust transient handling.
@@ -114,17 +155,31 @@ def extract_currents_from_chrono(
         min_ignore_s: Minimum time to always ignore at start (s)
         max_ignore_fraction: Maximum fraction of total time to ignore for transient
         di_dt_tol_rel: Relative derivative threshold for "settled" detection
+        min_transient_points: Minimum number of points to ignore for transient
         
         i0_window_fraction: Fraction of total time for I0 averaging window
         i0_min_points: Minimum points in I0 window
+        i0_method: I0 extraction method:
+            - "early_median": median of first K points in window (default, early-biased)
+            - "legacy_median": median of full window (backward compatible)
+            - "early_quantile": high quantile (i0_early_quantile) of window
+            - "first_point": first point after transient (most aggressive)
+        i0_early_quantile: Quantile to use for "early_quantile" method (default 0.85)
+        i0_decay_threshold: If i_end/i_start < this in I0 window, use early-biased method
         
         tail_fraction: Fraction of data to consider as tail for Iss
         tail_min_points: Minimum points in tail
         ss_di_dt_tol_rel: Derivative threshold for steady-state detection
         ss_min_consecutive: Minimum consecutive points for steady-state
+        ss_flatness_tol: Relative range (p90-p10)/median tolerance for flatness
     
     Returns:
         dict with I0_A, Iss_A, t0_range_s, tss_range_s, and new QC fields:
+        - I0_raw_A: Median of raw (signed) current in I0 window
+        - Iss_raw_A: Median of raw (signed) current in Iss window
+        - current_abs_applied: True if I0 window or Iss window had negative median
+        - i0_method_used: Actual method used for I0 extraction
+        - i0_method_params: Parameters for I0 method (K, quantile, etc.)
         - transient_ignored_s: Time ignored for capacitive transient
         - i0_n_points: Points used for I0 calculation
         - iss_n_points: Points used for Iss calculation  
@@ -132,10 +187,13 @@ def extract_currents_from_chrono(
         - sorted_applied: Whether time-sorting was applied
         - n_raw: Raw data length
         - n_clean: Clean data length after filtering
+        - n_duplicates_merged: Number of duplicate timestamps merged
         - qc_pass: Overall QC pass flag
+        - qc_flags: List of machine-readable QC flags
         - warnings: List of warnings
     """
     warnings: List[str] = []
+    qc_flags: List[str] = []
     n_raw = len(t_s)
     
     # =========================================================================
@@ -146,20 +204,28 @@ def extract_currents_from_chrono(
     if len(t_s) != len(i_a):
         return {
             "I0_A": None, "Iss_A": None,
+            "I0_raw_A": None, "Iss_raw_A": None,
+            "current_abs_applied": False,
+            "i0_method_used": None, "i0_method_params": {},
             "t0_range_s": None, "tss_range_s": None,
             "transient_ignored_s": 0.0, "i0_n_points": 0, "iss_n_points": 0,
             "ss_detected": False, "sorted_applied": False,
-            "n_raw": n_raw, "n_clean": 0, "qc_pass": False,
+            "n_raw": n_raw, "n_clean": 0, "n_duplicates_merged": 0,
+            "qc_pass": False, "qc_flags": ["input_length_mismatch"],
             "warnings": ["Input arrays have different lengths"]
         }
     
     if len(t_s) < 10:
         return {
             "I0_A": None, "Iss_A": None,
+            "I0_raw_A": None, "Iss_raw_A": None,
+            "current_abs_applied": False,
+            "i0_method_used": None, "i0_method_params": {},
             "t0_range_s": None, "tss_range_s": None,
             "transient_ignored_s": 0.0, "i0_n_points": 0, "iss_n_points": 0,
             "ss_detected": False, "sorted_applied": False,
-            "n_raw": n_raw, "n_clean": len(t_s), "qc_pass": False,
+            "n_raw": n_raw, "n_clean": len(t_s), "n_duplicates_merged": 0,
+            "qc_pass": False, "qc_flags": ["insufficient_data"],
             "warnings": ["Insufficient data points (< 10)"]
         }
     
@@ -172,16 +238,21 @@ def extract_currents_from_chrono(
     n_nonfinite = np.sum(~finite_mask)
     if n_nonfinite > 0:
         warnings.append(f"Removed {n_nonfinite} non-finite values")
+        qc_flags.append("nonfinite_values_removed")
         t = t[finite_mask]
         i = i[finite_mask]
     
     if len(t) < 10:
         return {
             "I0_A": None, "Iss_A": None,
+            "I0_raw_A": None, "Iss_raw_A": None,
+            "current_abs_applied": False,
+            "i0_method_used": None, "i0_method_params": {},
             "t0_range_s": None, "tss_range_s": None,
             "transient_ignored_s": 0.0, "i0_n_points": 0, "iss_n_points": 0,
             "ss_detected": False, "sorted_applied": False,
-            "n_raw": n_raw, "n_clean": len(t), "qc_pass": False,
+            "n_raw": n_raw, "n_clean": len(t), "n_duplicates_merged": 0,
+            "qc_pass": False, "qc_flags": qc_flags + ["insufficient_data_after_filter"],
             "warnings": warnings + ["Insufficient clean data points"]
         }
     
@@ -190,43 +261,66 @@ def extract_currents_from_chrono(
     dt_check = np.diff(t)
     if np.any(dt_check < 0):
         warnings.append("Time array not monotonically increasing; sorted by time")
+        qc_flags.append("time_sorted")
         sort_idx = np.argsort(t)
         t = t[sort_idx]
         i = i[sort_idx]
         sorted_applied = True
     
-    # Check for duplicate times
+    # Handle duplicate times - CRITICAL FIX #3
+    n_duplicates_merged = 0
     if len(np.unique(t)) < len(t):
-        warnings.append("Duplicate time values detected; kept original order")
+        t, i, n_duplicates_merged = _deduplicate_time_series(t, i)
+        warnings.append(f"Merged {n_duplicates_merged} duplicate time values (took median of current)")
+        qc_flags.append("duplicate_time_deduped")
     
     n_clean = len(t)
     t_total = t[-1] - t[0]
     eps = 1e-15
     
+    if t_total <= 0:
+        return {
+            "I0_A": None, "Iss_A": None,
+            "I0_raw_A": None, "Iss_raw_A": None,
+            "current_abs_applied": False,
+            "i0_method_used": None, "i0_method_params": {},
+            "t0_range_s": None, "tss_range_s": None,
+            "transient_ignored_s": 0.0, "i0_n_points": 0, "iss_n_points": 0,
+            "ss_detected": False, "sorted_applied": sorted_applied,
+            "n_raw": n_raw, "n_clean": n_clean, "n_duplicates_merged": n_duplicates_merged,
+            "qc_pass": False, "qc_flags": qc_flags + ["zero_time_span"],
+            "warnings": warnings + ["Time span is zero or negative"]
+        }
+    
     # Work with absolute current
     i_abs = np.abs(i)
-    i_scale = np.median(i_abs) + eps
     
     # =========================================================================
     # Transient Detection and I0 Extraction
     # =========================================================================
     
     transient_ignored_s = 0.0
+    transient_end_idx = 0
     t_ignore_end = t[0]
     
     if transient_mode == "auto" and len(t) > 20:
         # Compute derivative on smoothed i_abs
+        # Use local scale for early region, not global
         derivative, dt_median = _compute_derivative(t, i_abs, smooth_window=5)
         
-        # Derivative threshold (relative to current scale)
-        di_dt_threshold = di_dt_tol_rel * i_scale / max(dt_median, eps)
+        # Use early region scale for threshold (first 10% or 20 points)
+        n_early = max(min(int(len(i_abs) * 0.1), 20), 5)
+        i_early_scale = np.median(i_abs[:n_early]) + eps
+        
+        di_dt_threshold = di_dt_tol_rel * i_early_scale / max(dt_median, eps)
         
         # Find earliest index k where derivative stays small for next M points
         M = min(5, len(derivative) - 1)
         k_settled = None
         
-        for k in range(2, len(derivative) - M):  # Start at 2 to skip very beginning
-            # Check if derivative is small for next M points
+        # Start at min_transient_points to enforce minimum transient
+        start_k = max(2, min_transient_points)
+        for k in range(start_k, len(derivative) - M):
             window_abs_deriv = np.abs(derivative[k:k + M])
             if np.all(window_abs_deriv <= di_dt_threshold):
                 k_settled = k
@@ -242,51 +336,124 @@ def extract_currents_from_chrono(
             t_ignore_end = min(t_ignore_end, t_max_ignore)
             
             transient_ignored_s = t_ignore_end - t[0]
+            transient_end_idx = np.searchsorted(t, t_ignore_end)
+            
+            # Guard: check if transient end is very late (slow double-layer charging)
+            if transient_ignored_s > t_total * 0.03:
+                warnings.append(f"Transient end at {transient_ignored_s:.3f}s ({transient_ignored_s/t_total*100:.1f}% of total); "
+                               "slow double-layer charging may bias I0")
+                qc_flags.append("transient_end_late")
         else:
             warnings.append("Capacitive transient not clearly detected; using conservative fallback")
+            qc_flags.append("transient_detection_failed")
             # Fallback: ignore min_ignore_s or 1% of total, whichever larger
             t_ignore_end = t[0] + max(min_ignore_s, t_total * 0.01)
             transient_ignored_s = t_ignore_end - t[0]
+            transient_end_idx = np.searchsorted(t, t_ignore_end)
     else:
         # No transient mode: just apply min_ignore_s
         t_ignore_end = t[0] + min_ignore_s
         transient_ignored_s = min_ignore_s
+        transient_end_idx = np.searchsorted(t, t_ignore_end)
     
     # I0 window: from t_ignore_end to t_ignore_end + (t_total * i0_window_fraction)
     t_i0_start = t_ignore_end
     t_i0_end_target = t_ignore_end + t_total * i0_window_fraction
     
-    # Ensure minimum points
+    # Ensure minimum points - FIXED: window cap relative to start_idx, not absolute 5%
     i0_mask = (t >= t_i0_start) & (t <= t_i0_end_target)
     n_i0 = np.sum(i0_mask)
     
     if n_i0 < i0_min_points:
-        # Extend window until we have enough points or hit 5% of data
-        sorted_indices = np.argsort(t)
-        start_idx = np.searchsorted(t[sorted_indices], t_i0_start)
-        end_idx = min(start_idx + i0_min_points, int(len(t) * 0.05), len(t))
+        # Extend window until we have enough points
+        # Cap is relative: at most 2x the desired window or i0_min_points*2, not absolute 5%
+        start_idx = np.searchsorted(t, t_i0_start)
+        max_window_points = max(i0_min_points * 2, int((n_clean - start_idx) * 0.1))
+        end_idx = min(start_idx + max(i0_min_points, n_i0), start_idx + max_window_points, len(t))
+        
         if end_idx > start_idx:
-            t_i0_end_target = t[sorted_indices[end_idx - 1]]
+            t_i0_end_target = t[end_idx - 1]
             i0_mask = (t >= t_i0_start) & (t <= t_i0_end_target)
             n_i0 = np.sum(i0_mask)
     
-    # Compute I0
+    # Get I0 window data
+    i0_method_used = i0_method
+    i0_method_params: Dict[str, Any] = {}
+    I0_raw: Optional[float] = None
+    current_abs_applied = False
+    
     if n_i0 > 0:
-        I0 = float(np.median(i_abs[i0_mask]))
+        i0_window_abs = i_abs[i0_mask]
+        i0_window_raw = i[i0_mask]
+        
+        # Compute raw median for output
+        I0_raw = float(np.median(i0_window_raw))
+        if I0_raw < 0:
+            current_abs_applied = True
+        
+        # Determine if window shows strong decay (Cottrell-like)
+        i_start_window = i0_window_abs[0] if len(i0_window_abs) > 0 else 1.0
+        i_end_window = i0_window_abs[-1] if len(i0_window_abs) > 0 else 1.0
+        decay_ratio = i_end_window / (i_start_window + eps)
+        strong_decay = decay_ratio < i0_decay_threshold
+        
+        if strong_decay and i0_method == "early_median":
+            # Use early-biased method (first K points)
+            K = min(i0_min_points, len(i0_window_abs))
+            I0 = float(np.median(i0_window_abs[:K]))
+            i0_method_params = {"K": K, "decay_ratio": float(decay_ratio)}
+            qc_flags.append("i0_strong_decay")
+            warnings.append(f"I0 window shows strong decay (ratio={decay_ratio:.2f}); using early-biased median (K={K})")
+        elif i0_method == "legacy_median":
+            I0 = float(np.median(i0_window_abs))
+            i0_method_params = {"window_size": len(i0_window_abs)}
+        elif i0_method == "early_median":
+            # No strong decay, but still use early portion
+            K = min(i0_min_points, len(i0_window_abs))
+            I0 = float(np.median(i0_window_abs[:K]))
+            i0_method_params = {"K": K}
+        elif i0_method == "early_quantile":
+            # Skip first few points (capacitive residual), then take high quantile
+            skip = min(2, len(i0_window_abs) // 4)
+            window_for_quantile = i0_window_abs[skip:] if skip < len(i0_window_abs) else i0_window_abs
+            I0 = float(np.percentile(window_for_quantile, i0_early_quantile * 100))
+            i0_method_params = {"quantile": i0_early_quantile, "skip_initial": skip}
+        elif i0_method == "first_point":
+            I0 = float(i0_window_abs[0])
+            i0_method_params = {"note": "single_point"}
+            qc_flags.append("i0_single_point")
+        else:
+            # Default fallback
+            I0 = float(np.median(i0_window_abs))
+            i0_method_used = "legacy_median"
+            i0_method_params = {"window_size": len(i0_window_abs)}
+        
         t0_range = [float(t_i0_start), float(t_i0_end_target)]
     else:
         # Fallback to first available point after transient
         first_valid_idx = np.searchsorted(t, t_i0_start)
         if first_valid_idx < len(t):
             I0 = float(i_abs[first_valid_idx])
+            I0_raw = float(i[first_valid_idx])
+            if I0_raw < 0:
+                current_abs_applied = True
             t0_range = [float(t[first_valid_idx]), float(t[first_valid_idx])]
             n_i0 = 1
+            i0_method_used = "first_point"
+            i0_method_params = {"note": "fallback_single_point"}
             warnings.append("I0 extracted from single point (insufficient data in window)")
+            qc_flags.append("i0_single_point")
         else:
             I0 = float(i_abs[0])
+            I0_raw = float(i[0])
+            if I0_raw < 0:
+                current_abs_applied = True
             t0_range = [float(t[0]), float(t[0])]
             n_i0 = 1
+            i0_method_used = "first_point"
+            i0_method_params = {"note": "fallback_first_point"}
             warnings.append("I0 fallback to first point")
+            qc_flags.append("i0_single_point")
     
     # =========================================================================
     # Iss Extraction with Steady-State Detection
@@ -308,6 +475,10 @@ def extract_currents_from_chrono(
     
     t_tail = t[tail_mask]
     i_tail = i_abs[tail_mask]
+    i_tail_raw = i[tail_mask]
+    
+    # CRITICAL FIX #2: Use TAIL scale for threshold, not global scale
+    i_tail_scale = np.median(i_tail) + eps
     
     # Steady-state detection
     ss_detected = False
@@ -317,11 +488,10 @@ def extract_currents_from_chrono(
         # Compute derivative in tail
         deriv_tail, dt_median_tail = _compute_derivative(t_tail, i_tail, smooth_window=5)
         
-        # Threshold
-        ss_threshold = ss_di_dt_tol_rel * i_scale / max(dt_median_tail, eps)
+        # Threshold based on TAIL scale (not global)
+        ss_threshold = ss_di_dt_tol_rel * i_tail_scale / max(dt_median_tail, eps)
         
         # Find segment where |deriv| is consistently small
-        # Look for ss_min_consecutive consecutive points
         consecutive_count = 0
         ss_start_idx = None
         ss_end_idx = None
@@ -332,7 +502,7 @@ def extract_currents_from_chrono(
                     ss_start_idx = idx
                 consecutive_count += 1
                 if consecutive_count >= ss_min_consecutive:
-                    ss_end_idx = idx + 1  # +1 because derivative is 1 shorter
+                    ss_end_idx = idx + 1
                     ss_detected = True
                     break
             else:
@@ -340,32 +510,56 @@ def extract_currents_from_chrono(
                 consecutive_count = 0
         
         if ss_detected and ss_start_idx is not None:
-            # Use that segment for Iss (adjust indices for original tail)
+            # Build segment mask
             ss_segment_mask = np.zeros(len(t_tail), dtype=bool)
-            # Derivative index maps to interval between [i, i+1], so we include point i+1
             seg_start = ss_start_idx
             seg_end = min(ss_end_idx + 1, len(t_tail))
             ss_segment_mask[seg_start:seg_end] = True
+            
+            # ADDITIONAL FLATNESS CHECK
+            segment_vals = i_tail[ss_segment_mask]
+            if len(segment_vals) >= 3:
+                p10 = np.percentile(segment_vals, 10)
+                p90 = np.percentile(segment_vals, 90)
+                seg_median = np.median(segment_vals)
+                relative_range = (p90 - p10) / (seg_median + eps)
+                
+                if relative_range > ss_flatness_tol:
+                    warnings.append(f"Steady-state segment has high variability (range/median={relative_range:.2f})")
+                    qc_flags.append("ss_high_variability")
     
     # Compute Iss
     qc_pass = True
+    Iss_raw: Optional[float] = None
     
     if ss_detected and ss_segment_mask is not None:
         Iss = float(np.median(i_tail[ss_segment_mask]))
+        Iss_raw = float(np.median(i_tail_raw[ss_segment_mask]))
+        if Iss_raw < 0:
+            current_abs_applied = True
         n_iss = int(np.sum(ss_segment_mask))
         tss_range = [float(t_tail[ss_segment_mask][0]), float(t_tail[ss_segment_mask][-1])]
     else:
         # Fallback: use last portion (legacy behavior) but set qc_pass=False
         n_fallback = max(int(n_tail * 0.5), min(10, n_tail))
         Iss = float(np.median(i_tail[-n_fallback:]))
+        Iss_raw = float(np.median(i_tail_raw[-n_fallback:]))
+        if Iss_raw < 0:
+            current_abs_applied = True
         n_iss = n_fallback
         tss_range = [float(t_tail[-n_fallback]), float(t_tail[-1])]
         warnings.append("Steady-state not detected; Iss is approximate (last window median)")
+        qc_flags.append("ss_not_detected")
         qc_pass = False
     
     return {
         "I0_A": I0,
         "Iss_A": Iss,
+        "I0_raw_A": I0_raw,
+        "Iss_raw_A": Iss_raw,
+        "current_abs_applied": current_abs_applied,
+        "i0_method_used": i0_method_used,
+        "i0_method_params": i0_method_params,
         "t0_range_s": t0_range,
         "tss_range_s": tss_range,
         "transient_ignored_s": float(transient_ignored_s),
@@ -375,7 +569,9 @@ def extract_currents_from_chrono(
         "sorted_applied": sorted_applied,
         "n_raw": n_raw,
         "n_clean": n_clean,
+        "n_duplicates_merged": n_duplicates_merged,
         "qc_pass": qc_pass,
+        "qc_flags": qc_flags,
         "warnings": warnings
     }
 
@@ -404,11 +600,16 @@ def compute_transference(
     - Checks delta_V is in linear regime (≤ 10-20 mV typical)
     - Strict mode fails hard on invalid inputs; lenient mode returns qc_pass=False
     
+    CRITICAL: R0/Rss must be INTERFACIAL RESISTANCE (R_ct + R_SEI from EIS semicircle),
+    NOT bulk electrolyte resistance Rb. Using Rb will severely bias tLi+ upward.
+    
     Args:
         I0: Initial current (A) - from chronoamperometry after transient
         Iss: Steady-state current (A) - from chronoamperometry end
         R0: Initial interfacial resistance (Ω) - from EIS before polarization
+            MUST be R_interface (Rct + Rsei), NOT Rb
         Rss: Steady-state interfacial resistance (Ω) - from EIS after polarization
+            MUST be R_interface (Rct + Rsei), NOT Rb
         delta_V: Applied potential step (V)
         strict: If True (default), invalid inputs cause success=False.
                 If False, attempts calculation with qc_pass=False and warnings.
@@ -461,6 +662,13 @@ def compute_transference(
         "Rss_ohm": Rss,
         "delta_V_V": delta_V
     }
+    
+    # CRITICAL WARNING #5: Resistance definition
+    warnings.append(
+        "IMPORTANT: R0/Rss must be interfacial resistance (Rct+Rsei from EIS semicircle), "
+        "NOT bulk electrolyte Rb. Using Rb will severely bias tLi+ upward."
+    )
+    qc_flags.append("resistance_definition_assumed_interface")
     
     # Helper for failure return
     def _fail_result(t_val=None, num=None, den=None, dv0=None, dvss=None, vd0=None, vdss=None):

@@ -32,18 +32,51 @@
         "subtitle": "凝胶聚合物电解质与智能窗分析平台",
         "welcome": "欢迎使用 GPE 实验室应用。使用侧边栏导航各模块：",
         "module_a": "模块 A：GPE 电化学计算器",
-        "module_a_import": "**📊 数据导入**：上传并映射数据文件",
-        "module_a_eis": "**⚡ EIS 电导率**：从阻抗谱计算离子电导率",
-        "module_a_temp": "**🌡️ 温度拟合**：Arrhenius 和 VFT 分析",
-        "module_a_trans": "**🔋 迁移数**：锂离子迁移数（tLi⁺）",
-        "module_a_lsv": "**📈 稳定窗口**：LSV 电化学稳定性",
         "module_b": "模块 B：智能窗分析",
-        "module_b_sw": "**🪟 智能窗**：ΔT、响应时间、着色效率（CE）",
         "module_c": "模块 C：实验室数据库",
-        "module_c_db": "**🗃️ 实验室数据库**：配方、批次、样品管理",
-        "module_c_analytics": "**📉 数据分析**：趋势与组分分析",
-        "module_c_reports": "**📝 报告**：导出测量报告",
-        "module_changelog": "**📋 更新报告**：查看版本更新历史"
+        "module_changelog": "更新报告",
+        "nav": {
+            "import": {
+                "title": "数据导入",
+                "desc": "上传并映射数据文件"
+            },
+            "eis": {
+                "title": "EIS 电导率",
+                "desc": "从阻抗谱计算离子电导率"
+            },
+            "temp_fits": {
+                "title": "温度拟合",
+                "desc": "Arrhenius 和 VFT 分析"
+            },
+            "transference": {
+                "title": "迁移数",
+                "desc": "锂离子迁移数（tLi⁺）"
+            },
+            "stability": {
+                "title": "稳定窗口",
+                "desc": "LSV 电化学稳定性"
+            },
+            "smart_window": {
+                "title": "智能窗",
+                "desc": "ΔT、响应时间、着色效率（CE）"
+            },
+            "database": {
+                "title": "实验室数据库",
+                "desc": "配方、批次、样品管理"
+            },
+            "analytics": {
+                "title": "数据分析",
+                "desc": "趋势与组分分析"
+            },
+            "reports": {
+                "title": "报告",
+                "desc": "导出测量报告"
+            },
+            "changelog": {
+                "title": "更新报告",
+                "desc": "查看版本更新历史"
+            }
+        }
     },
     "import": {
         "page_title": "数据导入 - GPE 实验室",

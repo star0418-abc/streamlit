@@ -82,11 +82,53 @@ Or install all dependencies:
 pip install -r requirements.txt
 ```
 
-### "No module named 'scipy'"
+### SciPy Not Installed (Optional)
+
+**SciPy is optional.** The app runs without it, but some features degrade:
+
+| Feature | Without SciPy |
+|---------|---------------|
+| VFT temperature fitting | Disabled (Arrhenius works) |
+| RC circuit fitting (EIS) | Disabled (Rb extraction works) |
+| Savitzky-Golay smoothing | Falls back to moving average |
+
+To install SciPy:
 
 ```bash
 pip install scipy
 ```
+
+### "DLL load failed" / Broken Install
+
+If a package is **installed but fails to load** (e.g., `OSError: DLL load failed`, `RuntimeError: binary incompatible`), the app detects this and shows repair instructions.
+
+**Symptoms**:
+- Error mentions DLL, binary, or ABI
+- Package shows as installed (`pip list`) but import fails
+
+**Repair steps** (pip):
+
+```bash
+pip uninstall <package>
+pip install --force-reinstall <package>
+
+# If still failing, rebuild your environment:
+pip install -r requirements.txt --force-reinstall
+```
+
+**Repair steps** (conda):
+
+```bash
+conda uninstall <package>
+conda install -c conda-forge <package>
+
+# Or create a fresh environment:
+conda create -n gpe_lab python=3.10
+conda activate gpe_lab
+pip install -r requirements.txt
+```
+
+The app captures a traceback summary for debugging—paste it in GitHub issues if you need help.
 
 ### Conda not found (Windows)
 
@@ -187,24 +229,180 @@ t("import.import_success", count=100)  # → "✅ Successfully imported 100 rows
 
 ```
 d:\cal\
-├── app.py                    # Entry point (navigation dashboard)
+├── app.py                    # Entry point (navigation dashboard, robust fallback design)
 ├── VERSION                   # Single source of truth for app version
 ├── run_streamlit.bat         # Windows launcher
 ├── requirements.txt          # Python dependencies
+├── .streamlit/
+│   └── config.toml           # Hides default sidebar nav (showSidebarNavigation=false)
 ├── pages/                    # Streamlit pages
 ├── logic/                    # Pure computation modules
 ├── database/                 # SQLite layer (WAL mode, Cloud-aware)
 ├── schemas/                  # Canonical DataFrame schemas
 ├── i18n/                     # Translation files (zh-CN.json, en.json)
 ├── utils/                    # Utility modules
-│   ├── i18n.py               # Internationalization utilities
-│   ├── deps.py               # Dependency checking
-│   ├── pathing.py            # Project root detection (idempotent)
+│   ├── i18n.py               # Internationalization (emergency fallback, default param)
+│   ├── ui_header.py          # UI header (lazy imports, no import-time st.*)
+│   ├── pages.py              # Centralized page registry (NAV_PAGES)
+│   ├── deps.py               # Dependency checking (broken-install detection, optional SciPy)
+│   ├── pathing.py            # Project root detection (multi-marker, cross-platform idempotent)
 │   └── version.py            # Version resolver (env → file → fallback)
 └── data/                     # Database + raw files (local only)
 ```
 
+## Path Resolution (`utils/pathing.py`)
+
+The pathing module provides deterministic project root detection and sys.path management for both local (Windows/macOS/Linux) and Streamlit Cloud environments.
+
+### Multi-Marker Root Detection
+
+To avoid false positives from nested files (e.g., `docs/README.md`), the module requires **multiple unique markers** before accepting a directory as project root:
+
+| Primary Markers | Secondary Markers |
+|-----------------|-------------------|
+| `app.py`, `VERSION`, `pages/`, `.streamlit/`, `.git` | `pyproject.toml`, `requirements.txt` |
+
+**Detection rules:**
+- Need ≥2 primary markers, OR
+- 1 primary marker + ≥1 secondary marker
+
+### Validated Fallback
+
+If marker-based detection fails, the fallback (parent of `utils/`) is **validated**:
+- Must contain `app.py` OR `pages/` directory
+- Otherwise raises `RuntimeError` with diagnostic info
+
+This prevents silent misconfiguration where a wrong directory is returned.
+
+### Cross-Platform sys.path Idempotency
+
+`ensure_project_root_in_path()` is truly idempotent on all platforms:
+- Windows: case-insensitive comparison (`C:/Foo` == `c:/foo`)
+- All platforms: normalized separators, resolved symlinks
+- Safe to call on every Streamlit rerun (no duplicate entries)
+
+### Cloud Behavior
+
+| Environment | Data Path |
+|-------------|-----------|
+| Local | `<project>/data/` |
+| Streamlit Cloud | `/tmp` (ephemeral, resets on restart) |
+
+Detection uses `STREAMLIT_SHARING` or `STREAMLIT_SERVER_PORT` environment variables.
+
+## Robustness Design
+
+The app is designed to **never white-screen** from import failures. Key design principles:
+
+### 1. `st.set_page_config` First
+All pages call `st.set_page_config()` before any other Streamlit command, including before importing modules that might call `st.*`.
+
+### 2. Safe i18n with Fallbacks
+```python
+from utils.i18n import t
+
+# Default parameter prevents crashes if key is missing
+title = t("home.title", default="GPE Lab")
+
+# Emergency fallback dictionary if JSON fails to load
+# App shows warning banner but remains functional
+```
+
+### 3. Lazy Imports in UI Modules
+`utils/ui_header.py` imports Streamlit inside function bodies, not at module level. This prevents import-time crashes.
+
+### 4. Centralized Page Registry
+All page paths are defined in `utils/pages.py` as `NAV_PAGES`. Benefits:
+- Single source of truth for page filenames
+- Easy to rename files (change one place)
+- Data-driven navigation rendering
+
+### 5. CSS Fallback for Sidebar
+Older Streamlit versions ignore `showSidebarNavigation=false`. The app injects CSS to hide default nav:
+```css
+[data-testid="stSidebarNav"] { display: none !important; }
+```
+
+### 6. Structured i18n Keys
+Navigation text uses structured keys instead of brittle string parsing:
+```json
+{
+  "home": {
+    "nav": {
+      "import": {
+        "title": "Import Data",
+        "desc": "Upload and map data files"
+      }
+    }
+  }
+}
+```
+
+## Dependency Checking (`utils/deps.py`)
+
+The dependency module provides robust checking for package availability, distinguishing "not installed" from "broken install" (DLL failures, ABI mismatches).
+
+### Core vs Optional Packages
+
+| Type | Packages | Behavior on Missing |
+|------|----------|---------------------|
+| **Core** | plotly, pandas, numpy, chardet, Jinja2, streamlit | `st.stop()` with error |
+| **Optional** | scipy | Warning + graceful degradation |
+
+### Broken Install Detection
+
+When a package is **installed but fails to load** (e.g., `OSError: DLL load failed`), the module:
+1. Catches the exception (not just `ImportError`)
+2. Captures traceback summary (last ~8 lines)
+3. Provides specific repair instructions (pip/conda)
+4. Sets `category: "broken"` in diagnostic dict
+
+### Usage in Pages
+
+```python
+from utils.deps import require_dependency, require_plotly, require_scipy
+
+# Core dependency (required=True by default) — stops page on failure
+require_plotly()
+
+# Optional dependency — shows warning, returns False
+if require_scipy():
+    # VFT fitting available
+    from scipy.optimize import curve_fit
+else:
+    # Fallback to Arrhenius-only mode
+    pass
+
+# Generic with custom impact message
+if not require_dependency("scipy", required=False, impact="Peak detection disabled"):
+    use_simple_extrema = True
+```
+
+### Diagnostic Return Structure
+
+`check_dependency()` returns a rich dict:
+
+```python
+{
+    "ok": bool,           # True if import succeeded
+    "required": bool,     # True for core packages
+    "version": str|None,  # Package version if available
+    "error": str|None,    # User-readable error message
+    "pip_name": str,      # Package name for pip install
+    "impact": str|None,   # Feature degradation note (optional packages)
+    "category": "missing" | "broken" | None,
+    "traceback_summary": str|None,  # For bug reports
+}
+```
+
+### Safety Guarantees
+
+- **No heavy imports at module level**: deps.py uses only stdlib (importlib, traceback, sys)
+- **Lazy streamlit import**: `require_*` functions import st inside function body
+- **Never crashes the app**: All exceptions caught and converted to structured diagnostics
+
 ## Version Management
+
 
 The app version is managed via a single source of truth:
 
@@ -265,16 +463,22 @@ The EIS module (`logic/eis.py`) works without SciPy for basic Rb extraction meth
 - `estimate_rb_intercept_linear()` — Linear extrapolation from HF band
 
 Advanced fitting (`fit_simple_rc`) requires SciPy. If missing, it returns `{success: False, error: "SciPy not installed"}`.
+`fit_simple_rc` also supports a depressed-semicircle CPE model via `model="rc_cpe"` (Rs + R||CPE).
 
 ### Rb Extraction Assumptions (SS/GPE/SS Cells)
 
 - **HF inductive artifacts** (>100 kHz from lead inductance) are automatically excluded before Rb estimation
+- **HF inductive artifacts** are also excluded before `fit_simple_rc()` HF band selection/fitting
 - **Sign convention**: Internal computation uses capacitive-negative Z_im; Nyquist plots display -Z_im (positive upper half)
 - **Frequency-based HF selection**: Uses top 1 decade (freq ≥ fmax/10), not point-count fractions
 
 ### RC Fitting Caveats
 
-`fit_simple_rc()` fits ONLY the HF semicircle (Rs + R||C). It is NOT valid for:
+`fit_simple_rc()` fits ONLY the HF semicircle. It supports:
+- `model="rc"`: Rs + (R||C) classic semicircle
+- `model="rc_cpe"`: Rs + (R||CPE) depressed semicircle (useful for GPE)
+
+It is NOT valid for:
 - Full-spectrum Randles+Warburg analysis
 - Diffusion-dominated spectra (blocking electrodes)
 
@@ -338,6 +542,19 @@ tLi+ = Iss × (ΔV - I0×R0) / [I0 × (ΔV - Iss×Rss)]
 
 This assumes **small polarization** in the linear regime (typically ΔV ≤ 10-20 mV).
 
+### CRITICAL: Resistance Requirements
+
+> [!CAUTION]
+> **R0/Rss must be INTERFACIAL resistance (R_ct + R_SEI), NOT bulk electrolyte Rb.**
+> Using Rb instead of R_interface will severely bias tLi+ upward.
+
+From EIS analysis:
+- R_interface = R_ct + R_SEI (from high-frequency semicircle diameter)
+- Rb = bulk electrolyte resistance (from HF real-axis intercept)
+- **Use R_interface, not Rb**
+
+The module adds a qc_flag `resistance_definition_assumed_interface` as a reminder.
+
 ### Strict vs Lenient Mode
 
 | Parameter | `strict=True` (default) | `strict=False` |
@@ -362,41 +579,76 @@ The corrected driving voltages are:
 
 If either is ≤0, the computation is physically invalid (IR drop exceeds applied voltage).
 
-### I0 Extraction (Capacitive Transient Handling)
+### I0 Extraction (Early-Biased Estimation)
 
-The initial current I0 is extracted **after** capacitive settling, not from the first 1% of time blindly:
+The initial current I0 is extracted **after** capacitive settling with early-biased estimation:
 
 1. **Transient detection** (`transient_mode="auto"`):
-   - Computes `|dI/dt|` on smoothed current
+   - Computes `|dI/dt|` on smoothed current using **early region scale** (not global median)
    - Finds earliest point where derivative stays small for 5 consecutive readings
-   - Ignores this initial capacitive spike region
+   - Minimum transient time enforced (`min_transient_points` parameter)
+   - Warning if transient ends late (>3% of total time) — slow double-layer charging
 
 2. **I0 window**: First 1% of time after transient, minimum 5 points
-3. **I0 = median(|I|)** in window (robust to outliers)
 
-Metadata returned: `transient_ignored_s`, `i0_n_points`
+3. **I0 extraction method** (`i0_method` parameter):
 
-### Iss Extraction (Steady-State Detection)
+| Method | Description | Use Case |
+|--------|-------------|----------|
+| `early_median` (default) | Median of first K points in window | Best for Cottrell-like decay |
+| `legacy_median` | Median of full window | Backward compatibility |
+| `early_quantile` | High quantile (85th percentile) | Aggressive early estimate |
+| `first_point` | First point after transient | Most aggressive |
 
-Steady-state current Iss is validated, not assumed from "last 10%":
+**Decay detection**: If current decays significantly within I0 window (`i_end/i_start < 0.8`), uses early-biased estimation and sets `qc_flag="i0_strong_decay"`.
+
+Metadata returned: `transient_ignored_s`, `i0_n_points`, `i0_method_used`, `i0_method_params`
+
+### Iss Extraction (Tail-Scale Detection)
+
+Steady-state current Iss is validated using **tail-scale thresholds**, not global current scale:
 
 1. **Tail region**: Last 20% of time (configurable)
-2. **Steady detection**: Finds segment where `|dI/dt|` is consistently small (≥10 consecutive points)
-3. If steady found: `ss_detected=True`, `Iss = median` of that segment
-4. If NOT found: `ss_detected=False`, `qc_pass=False`, uses last-window median with warning
+2. **Threshold calculation**: Uses `i_tail_scale = median(|I|)` in tail, NOT global median
+3. **Steady detection**: Finds segment where `|dI/dt|` is consistently small (≥10 consecutive points)
+4. **Flatness check**: Validates `(p90 - p10) / median < ss_flatness_tol` in steady segment
+5. If steady found: `ss_detected=True`, `Iss = median` of that segment
+6. If NOT found: `ss_detected=False`, `qc_pass=False`, uses last-window median with warning
+
+### Duplicate Time Handling
+
+Real CA data often has duplicate timestamps. The module handles these robustly:
+
+1. **Detection**: After sorting, checks for duplicate `t` values
+2. **Deduplication**: Groups identical timestamps, replaces `i` with median per timestamp
+3. **Reporting**: Sets `qc_flag="duplicate_time_deduped"` and reports `n_duplicates_merged`
+
+This prevents `dt=0` from poisoning derivative calculations.
 
 ### QC Flags
 
-The `qc_flags` list contains structured issue identifiers:
+**Computation-level flags (from `compute_transference`):**
 
 | Flag | Meaning |
 |------|---------|
+| `resistance_definition_assumed_interface` | Reminder: R0/Rss must be interfacial |
 | `deltaV_too_large` | ΔV > 100 mV (non-linear regime) |
 | `effective_voltage_nonpositive` | IR drop exceeds ΔV |
 | `iss_ge_i0` | Iss ≥ I0 (unusual, not at steady-state) |
 | `t_negative` | tLi+ < 0 (physics error) |
-| `t_above_unity` | tLi+ > 1 (parasitic reactions or not steady) |
-| `denominator_near_zero` | Numerical instability |
+| `t_above_unity` | tLi+ > 1 (parasitic reactions) |
+
+**Extraction-level flags (from `extract_currents_from_chrono`):**
+
+| Flag | Meaning |
+|------|---------|
+| `time_sorted` | Input was non-monotonic, had to sort |
+| `duplicate_time_deduped` | Duplicate timestamps were merged |
+| `transient_end_late` | Transient ended late (slow double-layer) |
+| `i0_strong_decay` | I0 window shows Cottrell-like decay |
+| `i0_single_point` | I0 from single point (insufficient data) |
+| `ss_not_detected` | Steady-state not detected in tail |
+| `ss_high_variability` | Steady segment has high noise |
 
 ### When `t_li_plus=None`
 
@@ -406,15 +658,15 @@ The function returns `t_li_plus=None` (and `success=False`) when:
 - Effective voltage (ΔV - I×R) ≤ 0
 - Denominator near zero
 
-In lenient mode (`strict=False`), large ΔV still attempts computation but sets `qc_pass=False`.
-
 ### Recommended Experimental Constraints
 
 For reliable Bruce-Vincent measurements:
 - **Small ΔV**: 10 mV typical, warn above 20 mV, reject above 100 mV
 - **Sufficient polarization time**: Until dI/dt ≈ 0 (check `ss_detected` flag)
 - **Symmetric cells**: Li/GPE/Li or equivalent blocking configuration
-- **Matched EIS**: R0 from EIS before polarization, Rss from EIS after
+- **Matched EIS**: R_interface from EIS before and after polarization
+- **Use interfacial R**: Extract R_ct + R_SEI from semicircle, not bulk Rb
+
 
 ## Temperature Fits Notes
 
@@ -505,16 +757,35 @@ Electrochemistry (CA) and optical transmittance data often have **trigger delays
 | Mode | Behavior |
 |------|----------|
 | `"none"` | No lag correction (default, safe for synchronized data) |
-| `"estimate"` | Auto-estimate lag via cross-correlation of |I| vs -dT/dt |
+| `"estimate"` | Auto-estimate lag via segment-aware cross-correlation |
 | `"manual"` | Use user-specified lag value |
 
-The estimation uses:
-1. CA signal: smoothed |I| (current magnitude)
-2. Optical signal: -dT/dt (rate of darkening aligns with charge injection)
-3. Cross-correlation over ±max_lag window
-4. Returns `lag_s`, `lag_correlation`, `lag_confident`
+**Lag Signal Mode** (`lag_signal_mode`, new in v2.0):
 
-If `lag_confident=False` (correlation < 0.3), the estimate may be unreliable.
+The original full-cycle correlation suffered from **sign cancellation**: coloring (T↓) and bleaching (T↑) have opposite dT/dt signs, causing their contributions to cancel when correlated together.
+
+| Mode | Behavior | Recommended |
+|------|----------|-------------|
+| `"coloring_only"` | Correlate only within T-decreasing segments | ✅ Default |
+| `"bleaching_only"` | Correlate only within T-increasing segments | For bleach-only data |
+| `"max_abs_corr"` | Try both, pick highest \|r\| | Good fallback |
+| `"full_cycle"` | Legacy behavior (may cancel) | ❌ Not recommended |
+
+The estimation uses:
+1. **Segment detection**: Identify coloring (T↓) and bleaching (T↑) regions
+2. **Per-segment correlation**: Compute cross-corr(|I|, |dT/dt|) within selected segment(s)
+3. **Confidence check**: Requires r > 0.3 AND margin > 0.05 between segments
+
+**Lag convention**:
+- Positive `lag_s` = optical lags current (optical was triggered later)
+- Correction: Subtract `lag_s` from optical time to align
+
+**Metadata returned** (in `align_meta["lag_estimation"]`):
+- `lag_signal_mode_used`: Which mode was actually used
+- `segment_used`: Which segment provided the best correlation
+- `best_corr`, `second_best_corr`, `corr_margin`: Correlation diagnostics
+- `coloring_fraction`, `bleaching_fraction`: Segment sizes
+- `n_points_used`: Data points in correlation
 
 ### Response Time (Plateau-Based t90)
 
@@ -558,20 +829,54 @@ If a segment spans both coloring→bleaching, net Q approaches zero, causing CE 
 - `auto_split_full_cycles=True` (default) detects this and splits at T extremum
 - Flag `segment_was_split_for_ce=True` indicates auto-splitting occurred
 
-### Baseline Correction (Default OFF)
+### Baseline/Leakage Current Correction
 
-The old approach fitted a line to the **initial portion** of current and subtracted it—this is **physically wrong** because:
-- Initial current spike is the main faradaic signal (coloring/bleaching)
-- Fitting to it removes the signal you want to integrate
+> **NEW in v2.0**: Enhanced baseline correction for GPE systems.
 
-**New modes** (`baseline_mode`):
+**The Problem (GPE Leakage Current)**:
+In gel polymer electrolyte (GPE) systems, there is often a non-zero leakage current (I_leak) that persists after the optical plateau. This causes:
+- Q_total = ∫I dt to grow with measurement time (even after T stabilizes)
+- CE = ΔOD/|Q| to decrease with longer test durations
+- **Non-comparable CE values** between experiments with different hold times
+
+**Solution**: Estimate I_leak from the tail region and subtract before integration:
+```
+Q_effective = ∫(I - I_leak) dt
+CE_corrected = ΔOD / |Q_effective|
+```
+
+**Baseline modes** (`baseline_mode` in `compute_charge_density` and `compute_cycling_metrics`):
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| `"none"` | No correction (default) | Most cases; safest |
-| `"offset_tail"` | Subtract median of last 10% | Remove DC offset only |
-| `"offset_head"` | Subtract median of first portion | If pre-step baseline exists |
-| `"linear_tail"` | Fit linear to tail; reject if R² < 0.8 | Only for clear drift |
+| `"none"` | No correction (default) | Liquid electrolytes, well-sealed cells |
+| `"offset_tail"` | Subtract median of last `tail_fraction` | **Recommended for GPE** |
+| `"offset_head"` | Subtract median of first `head_fraction` | Pre-step baseline exists |
+| `"offset_both"` | Average of head and tail medians | Unknown baseline |
+
+**Output when baseline_mode != "none"**:
+- `q_c_cm2`: Corrected charge density (leakage subtracted)
+- `q_c_cm2_raw`: Original charge density (no correction)
+- `ce_cm2_c`: CE using corrected Q
+- `ce_cm2_c_raw`: CE using raw Q (for comparison)
+- `i_baseline_A`: Estimated leakage current
+- Warning if CE differs by >10% after correction
+
+**Example**:
+```python
+# Without correction (liquid electrolyte)
+q_result = compute_charge_density(t_s, i_a, area)
+
+# With GPE leakage correction
+q_result = compute_charge_density(
+    t_s, i_a, area,
+    baseline_mode="offset_tail",
+    tail_fraction=0.2  # Use last 20% to estimate leakage
+)
+print(f"Q_raw = {q_result['q_abs_c_cm2_raw']:.4f} C/cm²")
+print(f"Q_corrected = {q_result['q_abs_c_cm2']:.4f} C/cm²")
+print(f"I_leak = {q_result['i_baseline_A']:.2e} A")
+```
 
 ### QC Flags
 
@@ -586,8 +891,63 @@ All functions return structured QC metadata:
 | `segment_type` | str | `"coloring"`, `"bleaching"`, `"unknown"` |
 | `lag_confident` | bool | Lag estimate is reliable (alignment) |
 | `ce_skipped_reason` | str | Why CE was not computed |
+| `baseline_mode` | str | Leakage correction mode used |
+| `i_baseline_A` | float | Estimated leakage current (if baseline_mode != "none") |
 
-`compute_cycling_metrics()` aggregates: `n_valid`, `n_coloring`, `n_bleaching`, `pct_valid`.
+`compute_cycling_metrics()` aggregates: `n_valid`, `n_coloring`, `n_bleaching`, `pct_valid`, `baseline_mode`.
+
+## Database Layer (`database/db.py`)
+
+The SQLite layer is designed for long-term robustness across Streamlit Cloud and local Windows/Linux environments.
+
+### Schema Versioning & Migrations
+
+The module uses `PRAGMA user_version` to track schema versions and applies incremental migrations automatically.
+
+| Version | Description |
+|---------|-------------|
+| v0 | Unversioned (legacy databases) |
+| v1 | Current schema (baseline) |
+
+**Migration safety:**
+- Migrations are **additive only** (ALTER TABLE ADD COLUMN, CREATE INDEX)
+- No destructive changes (DROP COLUMN not used)
+- `column_exists()` checks prevent duplicate ALTER TABLE errors
+- Existing data is preserved across schema upgrades
+
+**Adding new migrations:** Edit `_migrate_vN_to_vN+1()` functions in `db.py` and increment `CURRENT_SCHEMA_VERSION`.
+
+### JSON Serialization Policy
+
+All JSON fields (`process_params_json`, `results_json`, etc.) use `safe_json_dumps()` which handles common scientific Python types:
+
+| Type | Conversion |
+|------|------------|
+| `datetime`/`date`/`time` | ISO 8601 string |
+| `Path` | `str(path)` |
+| numpy scalars (`np.float32`, `np.int64`) | Python scalars via `.item()` |
+| pandas `Timestamp`/`Timedelta` | ISO string or `str()` |
+| `Decimal` | `float` |
+| `Enum` | `.value` |
+| `set`/`tuple` | `list` |
+| Unknown types | `str(obj)` + warning logged |
+
+This prevents crashes when upstream code passes datetime, numpy, or Path objects.
+
+### Concurrency Safety
+
+- **Thread-safe init:** Module-level `threading.Lock` protects first-time initialization
+- **WAL mode:** Enables concurrent reads during writes
+- **Busy timeout:** 30s timeout prevents "database is locked" errors
+- **Foreign keys:** Enforced via PRAGMA
+
+### Error Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Directory creation fails (local) | `RuntimeError` with actionable suggestions |
+| Directory creation fails (Cloud) | `RuntimeError` (unexpected, /tmp should be writable) |
+| Init failure | Error cached, subsequent operations raise clear message |
 
 ## Traceability
 
