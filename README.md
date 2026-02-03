@@ -98,6 +98,8 @@ To install SciPy:
 pip install scipy
 ```
 
+SciPy is imported lazily; missing or broken installs return clear errors while the app keeps running (Arrhenius still works).
+
 ### "DLL load failed" / Broken Install
 
 If a package is **installed but fails to load** (e.g., `OSError: DLL load failed`, `RuntimeError: binary incompatible`), the app detects this and shows repair instructions.
@@ -146,6 +148,7 @@ The app captures a traceback summary for debugging—paste it in GitHub issues i
 ### Module A: GPE Electrochem Calculator
 - **Conductivity from EIS**: Interactive Nyquist plot with Rb extraction → σ = L/(Rb×S)
 - **Temperature Fits**: Arrhenius (Ea in kJ/mol) and VFT with apparent Ea clarification
+- **VFT Robustness**: Data-driven bounds handle high-resistance/low-temperature data; apparent Ea respects prefactor models (standard / T⁻¹ / T⁻⁰·⁵)
 - **Transference Number**: Bruce-Vincent method with validation warnings
 - **Stability Window**: LSV onset detection with configurable thresholds
 
@@ -486,6 +489,10 @@ For quantitative equivalent circuit analysis, use specialized software (ZView, R
 
 ## LSV Analysis Notes
 
+Recent updates:
+- CV-like potential reversal is handled more safely by selecting the monotonic segment consistent with oxidation/reduction.
+- Tangent onset is more robust for GPE-style current creep / exponential rise (avoids end-peak trap).
+
 ### SciPy Optional
 
 LSV smoothing (`logic/lsv.py`) uses Savitzky-Golay filter from SciPy. If SciPy is missing:
@@ -506,14 +513,14 @@ LSV smoothing (`logic/lsv.py`) uses Savitzky-Golay filter from SciPy. If SciPy i
 
 **Tangent method** (recommended for GPE):
 - Fits constant/linear baseline from first 10% of sweep (median-based, robust)
-- Identifies rising region via max derivative on smoothed current
-- Fits tangent line around max derivative
+- Uses robust early-rise derivative thresholding and mid-current band selection
+- Fits tangent line around the early steepest rise (avoids end-peak trap)
 - Onset = intersection of baseline and tangent lines
 
 ### CV Auto-Segmentation
 
 If the potential array is non-monotonic (e.g., CV data uploaded instead of LSV):
-- The longest monotonic segment is automatically extracted
+- The monotonic segment containing the global max/min potential is selected based on direction
 - A warning is included describing what was done
 - The data is NOT sorted (preserves time order for correct onset logic)
 
@@ -700,6 +707,7 @@ The previous approach comparing `vft_r2 - arr_r2 > 0.02` is biased:
 |----------------|--------|
 | median(T) < 150 AND max(T) < 250 | Auto-convert °C → K with warning |
 | Any T < 0 | Auto-convert °C → K with warning |
+| 150 ≤ min(T) and max(T) ≤ 250 (auto) | Ambiguous; assume K but warn to set `temp_unit` explicitly |
 | Otherwise | Assume Kelvin |
 
 Override with `temp_unit="K"` or `temp_unit="C"` to skip auto-detection.
@@ -711,6 +719,8 @@ Override with `temp_unit="K"` or `temp_unit="C"` to skip auto-detection.
 | `standard` | ln(σ) = ln(A) - B/(T-T₀) | Default, most common |
 | `T^-1` | ln(σ) = ln(A) - ln(T) - B/(T-T₀) | Theoretical models |
 | `T^-0.5` | ln(σ) = ln(A) - 0.5·ln(T) - B/(T-T₀) | Some polymer systems |
+
+`apparent_ea_vft()` is prefactor-aware: T^-1 subtracts RT, and T^-0.5 subtracts 0.5·RT.
 
 All three have the same number of fitted parameters (k=3).
 

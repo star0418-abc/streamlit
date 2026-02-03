@@ -10,7 +10,7 @@ ONSET METHODS:
 
 CV HANDLING:
 - Non-monotonic potential is auto-detected
-- Longest monotonic segment extracted with warning
+- Monotonic segment selected by preference (max/min/longest) with warning
 """
 import numpy as np
 from typing import Dict, Any, Optional, Tuple, List, Literal
@@ -79,19 +79,22 @@ def _optional_savgol(
 
 def _select_monotonic_segment(
     e_v: np.ndarray, 
-    j: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    j: np.ndarray,
+    prefer: Literal["longest", "max", "min"] = "longest"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], Dict[str, Any]]:
     """
-    Detect CV (non-monotonic potential) and extract longest monotonic segment.
+    Detect CV (non-monotonic potential) and extract a monotonic segment.
     
     Returns:
-        (e_seg, j_seg, idx_map, warnings)
+        (e_seg, j_seg, idx_map, warnings, selection_info)
         - idx_map: indices in original array corresponding to segment
     """
     warnings = []
+    selection_info: Dict[str, Any] = {"preference": prefer}
     
     if len(e_v) < 3:
-        return e_v.copy(), j.copy(), np.arange(len(e_v)), warnings
+        selection_info.update({"selected_segment": [0, len(e_v)]})
+        return e_v.copy(), j.copy(), np.arange(len(e_v)), warnings, selection_info
     
     # Check for monotonicity - handle de=0 at direction reversals
     de = np.diff(e_v)
@@ -116,10 +119,11 @@ def _select_monotonic_segment(
     
     if sign_changes == 0:
         # Already monotonic
-        return e_v.copy(), j.copy(), np.arange(len(e_v)), warnings
+        selection_info.update({"selected_segment": [0, len(e_v)]})
+        return e_v.copy(), j.copy(), np.arange(len(e_v)), warnings, selection_info
     
     warnings.append(f"Non-monotonic potential detected ({sign_changes} sign changes); "
-                   "likely CV input. Extracting longest monotonic segment.")
+                   f"likely CV input. Selecting monotonic segment (prefer='{prefer}').")
     
     # Find all monotonic segments
     segments = []
@@ -137,19 +141,106 @@ def _select_monotonic_segment(
     
     # Last segment
     segments.append((start_idx, len(e_v)))
-    
-    # Find longest segment
-    longest = max(segments, key=lambda x: x[1] - x[0])
-    start, end = longest
+
+    def _segment_metrics(seg: Tuple[int, int]) -> Dict[str, Any]:
+        start, end = seg
+        e_start = float(e_v[start])
+        e_end = float(e_v[end - 1])
+        return {
+            "start": start,
+            "end": end,
+            "length": end - start,
+            "delta_e": e_end - e_start,
+        }
+
+    seg_info = [_segment_metrics(seg) for seg in segments]
+
+    start, end = None, None
+    selection_reason = "longest"
+
+    if prefer in ("max", "min"):
+        idx_max = int(np.argmax(e_v))
+        idx_min = int(np.argmin(e_v))
+
+        if prefer == "max":
+            target_val = e_v[idx_max]
+            target_indices = np.where(np.isclose(e_v, target_val, rtol=0, atol=1e-12))[0]
+        else:
+            target_val = e_v[idx_min]
+            target_indices = np.where(np.isclose(e_v, target_val, rtol=0, atol=1e-12))[0]
+
+        def _contains(seg: Dict[str, Any], idx: int) -> bool:
+            return seg["start"] <= idx < seg["end"]
+
+        candidates = [
+            seg for seg in seg_info
+            if any(_contains(seg, idx) for idx in target_indices)
+        ]
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            start, end = chosen["start"], chosen["end"]
+            selection_reason = f"contains_global_{prefer}"
+        elif len(candidates) > 1:
+            # Tie-break for reduction: prefer segment with strongest negative current
+            chosen = None
+            if prefer == "min":
+                min_j_vals = []
+                for seg in candidates:
+                    j_seg = j[seg["start"]:seg["end"]]
+                    min_j_vals.append(float(np.min(j_seg)) if len(j_seg) else 0.0)
+                if np.any(np.array(min_j_vals) < 0):
+                    idx_best = int(np.argmin(min_j_vals))
+                    chosen = candidates[idx_best]
+                    selection_reason = "min_tie_break_by_reduction_current"
+            if chosen is None:
+                # Default tie-break: longer and/or larger |ΔE|
+                chosen = max(
+                    candidates,
+                    key=lambda s: (s["length"], abs(s["delta_e"]))
+                )
+                selection_reason = "tie_break_by_length_or_delta_e"
+
+            # Final deterministic tie-break: extreme closer to segment end
+            if chosen is not None:
+                if prefer == "max":
+                    extreme_indices = target_indices
+                else:
+                    extreme_indices = target_indices
+                tied = [
+                    seg for seg in candidates
+                    if seg["length"] == chosen["length"]
+                    and np.isclose(abs(seg["delta_e"]), abs(chosen["delta_e"]), rtol=0, atol=1e-12)
+                ]
+                if len(tied) > 1:
+                    def _extreme_pos(seg: Dict[str, Any]) -> int:
+                        in_seg = [i for i in extreme_indices if _contains(seg, i)]
+                        return max(in_seg) if in_seg else seg["start"]
+                    chosen = max(tied, key=_extreme_pos)
+                    selection_reason = f"{selection_reason}_extreme_position"
+
+            start, end = chosen["start"], chosen["end"]
+
+    if start is None or end is None:
+        # Fallback: longest segment
+        longest = max(seg_info, key=lambda s: s["length"])
+        start, end = longest["start"], longest["end"]
+        selection_reason = "fallback_longest"
     
     idx_map = np.arange(start, end)
     e_seg = e_v[start:end]
     j_seg = j[start:end]
     
-    warnings.append(f"Using segment [{start}:{end}] ({len(e_seg)} points) "
-                   f"from {len(e_v)} total points")
+    warnings.append(
+        f"Using segment [{start}:{end}] ({len(e_seg)} points) from {len(e_v)} total points "
+        f"(selection: {selection_reason}, prefer='{prefer}')."
+    )
+    selection_info.update({
+        "selected_segment": [int(start), int(end)],
+        "selection_reason": selection_reason
+    })
     
-    return e_seg, j_seg, idx_map, warnings
+    return e_seg, j_seg, idx_map, warnings, selection_info
 
 
 def _robust_baseline(
@@ -319,8 +410,8 @@ def _tangent_onset(
     
     1. Transform current so rise is always positive (j_eff)
     2. Compute derivative dj_eff/dE on smoothed data
-    3. Find max derivative index (excluding edges)
-    4. Fit tangent line in window around max derivative
+    3. Find early-rise region using robust derivative threshold
+    4. Select steepest rise within a mid-current band (avoids end-peak trap)
     5. Find intersection of tangent with baseline
     
     Returns:
@@ -350,25 +441,78 @@ def _tangent_onset(
     # Avoid division by zero
     de_safe = np.where(np.abs(de) < 1e-12, 1e-12, de)
     derivative = dj / de_safe
-    
-    # Find max derivative, excluding first/last 10% of points
-    exclude_n = max(3, int(len(derivative) * 0.1))
-    search_range = slice(exclude_n, len(derivative) - exclude_n)
-    
-    if len(derivative[search_range]) < 5:
-        warnings.append("Insufficient range for derivative peak search")
-        return None, fit_params, warnings
-    
-    # Only consider positive derivatives (rising current)
-    derivative_search = derivative[search_range].copy()
-    derivative_search[derivative_search < 0] = 0
-    
-    if derivative_search.max() <= 0:
+
+    if np.max(derivative) <= 0:
         warnings.append("No rising region found for tangent method")
         return None, fit_params, warnings
-    
-    idx_peak_local = np.argmax(derivative_search)
-    idx_peak = exclude_n + idx_peak_local
+
+    if len(derivative) < 5:
+        warnings.append("Insufficient range for derivative analysis")
+        return None, fit_params, warnings
+
+    # Robust derivative threshold from early baseline region
+    n0 = max(20, int(0.1 * len(e_v)))
+    n0 = min(n0, len(e_v) // 2)
+    baseline_end = max(1, min(len(derivative), n0 - 1))
+    baseline_deriv = derivative[:baseline_end]
+
+    med = float(np.median(baseline_deriv))
+    mad = float(np.median(np.abs(baseline_deriv - med)))
+    thr = max(med + 5.0 * mad, 0.0)
+
+    min_consecutive = 3
+    above_thr = derivative > thr
+    idx_rise_start = None
+    run = 0
+    for i, flag in enumerate(above_thr):
+        if flag:
+            run += 1
+            if run >= min_consecutive:
+                idx_rise_start = i - min_consecutive + 1
+                break
+        else:
+            run = 0
+
+    # Current band (avoid end-region where j is too high)
+    j_eff_mid = j_eff[1:]
+    pos_vals = j_eff[j_eff > 0]
+    if pos_vals.size >= 5:
+        j_ref = float(np.percentile(pos_vals, 95))
+    elif pos_vals.size > 0:
+        j_ref = float(np.max(pos_vals))
+    else:
+        j_ref = float(np.max(j_eff))
+
+    frac_lo, frac_hi = 0.05, 0.30
+    if j_ref > 0:
+        j_band = (j_eff_mid >= frac_lo * j_ref) & (j_eff_mid <= frac_hi * j_ref)
+    else:
+        j_band = np.ones_like(derivative, dtype=bool)
+
+    candidate = above_thr & j_band
+    if idx_rise_start is not None:
+        candidate &= (np.arange(len(derivative)) >= idx_rise_start)
+
+    selection_method = "robust_rise"
+    if np.any(candidate):
+        idx_peak = int(np.argmax(np.where(candidate, derivative, -np.inf)))
+    else:
+        warnings.append("No robust rise detected; using constrained max-derivative fallback")
+        selection_method = "fallback_constrained"
+
+        exclude_n = max(3, int(len(derivative) * 0.1))
+        search_end = max(1, len(derivative) - exclude_n)
+        search_mask = np.zeros_like(derivative, dtype=bool)
+        search_mask[:search_end] = True
+
+        candidate_fb = search_mask & j_band
+        if np.any(candidate_fb):
+            idx_peak = int(np.argmax(np.where(candidate_fb, derivative, -np.inf)))
+        elif np.any(search_mask):
+            idx_peak = int(np.argmax(np.where(search_mask, derivative, -np.inf)))
+        else:
+            warnings.append("No valid range for derivative fallback")
+            return None, fit_params, warnings
     
     # Fit tangent line in window around peak (±5 points)
     window_half = 5
@@ -393,6 +537,8 @@ def _tangent_onset(
     fit_params["tangent_slope"] = float(tangent_slope)
     fit_params["tangent_intercept"] = float(tangent_intercept)
     fit_params["derivative_peak_idx"] = int(idx_peak)
+    fit_params["derivative_threshold"] = float(thr)
+    fit_params["selection_method"] = selection_method
     
     # Get baseline value/function
     if baseline_params.get("type") == "linear":
@@ -510,14 +656,19 @@ def find_onset_potential(
     # =========================================================================
     # CV Detection: Extract monotonic segment if needed
     # =========================================================================
-    e_seg, j_seg, idx_map, cv_warnings = _select_monotonic_segment(e_v, j_ma_cm2)
+    segment_prefer = "max" if direction == "oxidation" else "min"
+    e_seg, j_seg, idx_map, cv_warnings, selection_info = _select_monotonic_segment(
+        e_v, j_ma_cm2, prefer=segment_prefer
+    )
     warnings.extend(cv_warnings)
     
     if len(cv_warnings) > 0:
         result["segment_info"] = {
             "original_length": len(e_v),
             "segment_length": len(e_seg),
-            "segment_indices": [int(idx_map[0]), int(idx_map[-1])]
+            "segment_indices": [int(idx_map[0]), int(idx_map[-1])],
+            "segment_preference": selection_info.get("preference"),
+            "selection_reason": selection_info.get("selection_reason")
         }
     
     # =========================================================================

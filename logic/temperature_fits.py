@@ -21,13 +21,7 @@ import warnings
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Literal
 
-# SciPy is optional - required only for VFT (nonlinear fitting)
-try:
-    from scipy.optimize import curve_fit
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-    curve_fit = None
+from utils import deps
 
 
 # Physical constants
@@ -173,6 +167,12 @@ def _handle_temp_unit(
         median_t = np.median(temps)
         max_t = np.max(temps)
         min_t = np.min(temps)
+
+        if 150 <= min_t <= 250 and 150 <= max_t <= 250:
+            temp_warnings.append(
+                "AUTO-DETECT AMBIGUOUS: Temperatures in the 150–250 range could "
+                "be Kelvin or Celsius. Please pass temp_unit='K' or 'C' explicitly."
+            )
         
         if median_t < 150 and max_t < 250:
             # Strongly suspect Celsius (typical lab range: 20-80°C)
@@ -234,7 +234,9 @@ def _compute_r2(y_obs: np.ndarray, y_pred: np.ndarray) -> float:
     """Coefficient of determination (R²)."""
     ss_res = np.sum((y_obs - y_pred) ** 2)
     ss_tot = np.sum((y_obs - y_obs.mean()) ** 2)
-    return float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else 0.0
+    return float(1 - ss_res / ss_tot)
 
 
 def _compute_aic(n: int, k: int, rss: float) -> float:
@@ -248,9 +250,10 @@ def _compute_aic(n: int, k: int, rss: float) -> float:
         k: number of fitted parameters
         rss: residual sum of squares (in ln-space)
     """
-    if n <= 0 or rss <= 0:
+    if n <= 0:
         return float('inf')
-    return n * np.log(rss / n) + 2 * k
+    rss_safe = max(float(rss), np.finfo(float).tiny)
+    return n * np.log(rss_safe / n) + 2 * k
 
 
 def _compute_aicc(n: int, k: int, rss: float) -> float:
@@ -276,9 +279,10 @@ def _compute_bic(n: int, k: int, rss: float) -> float:
     
     BIC = n * ln(RSS/n) + k * ln(n)
     """
-    if n <= 0 or rss <= 0:
+    if n <= 0:
         return float('inf')
-    return n * np.log(rss / n) + k * np.log(n)
+    rss_safe = max(float(rss), np.finfo(float).tiny)
+    return n * np.log(rss_safe / n) + k * np.log(n)
 
 
 def _interpret_delta_ic(delta: float) -> str:
@@ -533,13 +537,40 @@ def vft_fit(
     Returns:
         dict with A, B_K, T0_K, r_squared, metrics, QC flags
     """
-    # Check SciPy availability
-    if not SCIPY_AVAILABLE:
+    # Check SciPy availability (optional dependency)
+    try:
+        scipy_ok = deps.require_scipy(impact="VFT temperature fitting disabled.")
+    except Exception as e:
+        dep = deps.check_dependency("scipy")
+        error_msg = dep.get("error") or f"SciPy check failed: {e}"
         return {
             "success": False,
-            "error": "VFT fitting requires SciPy (pip install scipy). "
-                     "Arrhenius fit (numpy-only) is still available.",
-            "scipy_required": True
+            "error": error_msg,
+            "scipy_required": True,
+            "scipy_status": dep.get("category", "unknown"),
+        }
+    if not scipy_ok:
+        dep = deps.check_dependency("scipy")
+        error_msg = dep.get("error") or (
+            "VFT fitting requires SciPy (pip install scipy). "
+            "Arrhenius fit (numpy-only) is still available."
+        )
+        return {
+            "success": False,
+            "error": error_msg,
+            "scipy_required": True,
+            "scipy_status": dep.get("category", "unknown"),
+        }
+    try:
+        from scipy.optimize import curve_fit
+    except Exception as e:
+        dep = deps.check_dependency("scipy")
+        error_msg = dep.get("error") or f"SciPy import failed: {e}"
+        return {
+            "success": False,
+            "error": error_msg,
+            "scipy_required": True,
+            "scipy_status": dep.get("category", "unknown"),
         }
     
     result_warnings = []
@@ -580,10 +611,34 @@ def vft_fit(
         return {"success": False, "error": str(e), "sanitize_metadata": sanitize_meta}
     
     result_warnings.extend(temp_meta["warnings"])
-    
+
+    # Tighten validity: enforce finite, positive T and σ after conversion
+    valid_mask = (
+        np.isfinite(temps_k_final)
+        & np.isfinite(sigmas_clean)
+        & (temps_k_final > 0)
+        & (sigmas_clean > 0)
+    )
+    if not np.all(valid_mask):
+        dropped = int(np.sum(~valid_mask))
+        temps_k_final = temps_k_final[valid_mask]
+        sigmas_clean = sigmas_clean[valid_mask]
+        result_warnings.append(
+            f"Dropped {dropped} invalid points after temperature conversion"
+        )
+        n = len(temps_k_final)
+        if n < 3:
+            return {
+                "success": False,
+                "error": f"VFT needs at least 3 data points (got {n} after filtering)",
+                "sanitize_metadata": sanitize_meta,
+                "temp_metadata": temp_meta,
+                "warnings": result_warnings
+            }
+        temp_meta["temp_range_K"] = (float(temps_k_final.min()), float(temps_k_final.max()))
+
     T_min = temps_k_final.min()
-    T_max = temps_k_final.max()
-    
+
     # Observed ln(sigma)
     ln_sigma_obs = np.log(sigmas_clean)
     
@@ -614,28 +669,43 @@ def vft_fit(
         T0_init_guess = T_min - 50  # Typical: T0 is 30-50 K below Tg
     else:
         T0_init_guess = T0_init
-    
-    # Ensure T0 initial guess is valid
-    T0_init_guess = min(T0_init_guess, T_min - 10)
-    
-    lnA_init = ln_sigma_obs.max() + 2  # A should be larger than max observed σ
-    B_init = 1000  # Typical B values: 500-2000 K
+
+    ln_sigma_min = float(ln_sigma_obs.min())
+    ln_sigma_max = float(ln_sigma_obs.max())
+    ln_sigma_span = ln_sigma_max - ln_sigma_min
+    margin = max(5.0, 0.25 * ln_sigma_span)
+
+    lnA_lower = min(-20.0, ln_sigma_min - margin)
+    lnA_upper = max(20.0, ln_sigma_max + margin)
+
+    lnA_init = ln_sigma_max + 2.0  # A should be larger than max observed σ
+    lnA_init = float(np.clip(lnA_init, lnA_lower, lnA_upper))
+
+    B_lower = 1.0
+    B_upper = 50000.0
+    B_init = float(np.clip(1000.0, B_lower, B_upper))
+
+    T0_lower = 0.0
+    tiny_margin = 1e-6
+    T0_upper = min(max(50.0, T_min - 5.0), T_min - tiny_margin)
+    if T0_upper <= T0_lower:
+        return {
+            "success": False,
+            "error": (
+                f"Invalid T0 bounds: T0_upper={T0_upper:.4g} ≤ T0_lower={T0_lower:.4g}. "
+                "Insufficient temperature span or invalid temperatures."
+            ),
+            "sanitize_metadata": sanitize_meta,
+            "temp_metadata": temp_meta,
+            "warnings": result_warnings
+        }
+    T0_init_guess = float(np.clip(T0_init_guess, T0_lower, T0_upper))
     
     try:
-        # Bounds to ensure physical validity
-        # T0 must be less than Tmin (otherwise T - T0 can be ≤ 0)
-        T0_upper = T_min - 5
-        
         bounds = (
-            [-20, 100, 50],           # Lower: lnA > some reasonable min, B > 100, T0 > 50 K
-            [20, 5000, T0_upper]      # Upper: reasonable limits
+            [lnA_lower, B_lower, T0_lower],
+            [lnA_upper, B_upper, T0_upper]
         )
-        
-        # Check if initial guess is within bounds
-        if T0_init_guess < 50:
-            T0_init_guess = 50
-        if T0_init_guess > T0_upper:
-            T0_init_guess = T0_upper - 10
         
         popt, pcov = curve_fit(
             vft_ln_model,
@@ -648,6 +718,28 @@ def vft_fit(
         
         lnA, B, T0 = popt
         A = np.exp(lnA)
+
+        def _hit_bound(value: float, bound: float) -> bool:
+            tol = 1e-8 + 1e-6 * max(1.0, abs(bound))
+            return abs(value - bound) <= tol
+
+        bounds_hit = []
+        if _hit_bound(lnA, lnA_lower):
+            bounds_hit.append("lnA at lower bound")
+        elif _hit_bound(lnA, lnA_upper):
+            bounds_hit.append("lnA at upper bound")
+        if _hit_bound(B, B_lower):
+            bounds_hit.append("B at lower bound")
+        elif _hit_bound(B, B_upper):
+            bounds_hit.append("B at upper bound")
+        if _hit_bound(T0, T0_lower):
+            bounds_hit.append("T0 at lower bound")
+        elif _hit_bound(T0, T0_upper):
+            bounds_hit.append("T0 at upper bound")
+        if bounds_hit:
+            result_warnings.append(
+                "Fit hit parameter bounds: " + ", ".join(bounds_hit)
+            )
         
         # Predictions in ln-space
         ln_sigma_pred = vft_ln_model(temps_k_final, lnA, B, T0)
@@ -703,6 +795,11 @@ def vft_fit(
             "n_points": n,
             "k_params": k,
             "vft_prefactor": vft_prefactor,
+            "bounds_used": {
+                "lnA": (float(lnA_lower), float(lnA_upper)),
+                "B": (float(B_lower), float(B_upper)),
+                "T0": (float(T0_lower), float(T0_upper)),
+            },
             # Metadata
             "temp_metadata": temp_meta,
             "sanitize_metadata": sanitize_meta,
@@ -724,26 +821,47 @@ def vft_fit(
         }
 
 
-def apparent_ea_vft(B_K: float, T0_K: float, T_ref_K: float) -> Dict[str, Any]:
+def apparent_ea_vft(
+    B_K: float,
+    T0_K: float,
+    T_ref_K: float,
+    vft_prefactor: Literal["standard", "T^-1", "T^-0.5"] = "standard"
+) -> Dict[str, Any]:
     """
     Compute apparent activation energy at a reference temperature for VFT.
-    
-    Ea_app(T) = R × B × T² / (T - T0)²
-    
+
+    Definition:
+        Ea = -R * d ln(σ) / d(1/T) = R * T^2 * d ln(σ) / dT
+
+    Prefactor-aware forms:
+        standard: ln(σ) = ln(A) - B/(T - T0)
+        T^-1:     ln(σ) = ln(A) - ln(T) - B/(T - T0)
+        T^-0.5:   ln(σ) = ln(A) - 0.5*ln(T) - B/(T - T0)
+
     This is temperature-dependent! Always report with the temperature.
-    
+
     Args:
         B_K: VFT B parameter in Kelvin
         T0_K: VFT T0 parameter in Kelvin
         T_ref_K: Reference temperature in Kelvin
-    
+        vft_prefactor: Prefactor model ("standard", "T^-1", "T^-0.5")
+
     Returns:
         dict with ea_apparent_kj_mol, ea_apparent_ev, at_temp_K
     """
     if T_ref_K <= T0_K:
         return {"error": f"T_ref ({T_ref_K} K) must be > T0 ({T0_K} K)"}
-    
-    ea_j_mol = R_GAS * B_K * (T_ref_K ** 2) / ((T_ref_K - T0_K) ** 2)
+
+    base = R_GAS * B_K * (T_ref_K ** 2) / ((T_ref_K - T0_K) ** 2)
+    if vft_prefactor == "standard":
+        ea_j_mol = base
+    elif vft_prefactor == "T^-1":
+        ea_j_mol = base - R_GAS * T_ref_K
+    elif vft_prefactor == "T^-0.5":
+        ea_j_mol = base - 0.5 * R_GAS * T_ref_K
+    else:
+        return {"error": f"Unknown vft_prefactor: {vft_prefactor}"}
+
     ea_kj_mol = ea_j_mol / 1000
     ea_ev = ea_j_mol / EV_TO_J_MOL
     
@@ -752,7 +870,8 @@ def apparent_ea_vft(B_K: float, T0_K: float, T_ref_K: float) -> Dict[str, Any]:
         "ea_apparent_ev": float(ea_ev),
         "at_temp_K": float(T_ref_K),
         "at_temp_C": float(T_ref_K - 273.15),
-        "note": "This Ea is temperature-dependent (VFT behavior)"
+        "note": "This Ea is temperature-dependent (VFT behavior)",
+        "vft_prefactor": vft_prefactor
     }
 
 
@@ -789,6 +908,7 @@ def compare_fits(
         - recommendation: human-readable recommendation string
         - explanation: detailed explanation for UI display
     """
+    scipy_available = deps.is_available("scipy")
     arr_result = arrhenius_fit(temps_k, sigmas, temp_unit=temp_unit)
     vft_result = vft_fit(temps_k, sigmas, temp_unit=temp_unit, vft_prefactor=vft_prefactor)
     
@@ -876,8 +996,8 @@ def compare_fits(
     elif arr_result.get("success"):
         best_model = "Arrhenius"
         recommendation = "Only Arrhenius fit succeeded"
-        if not SCIPY_AVAILABLE:
-            explanation = "VFT fitting requires SciPy (not installed)."
+        if not scipy_available or vft_result.get("scipy_required"):
+            explanation = "VFT fitting requires SciPy (not installed or broken)."
         else:
             explanation = f"VFT fit failed: {vft_result.get('error', 'unknown error')}"
             
@@ -901,7 +1021,7 @@ def compare_fits(
         "recommendation": recommendation,
         "explanation": explanation,
         # Backward compatibility
-        "scipy_available": SCIPY_AVAILABLE
+        "scipy_available": scipy_available
     })
     
     return comparison
